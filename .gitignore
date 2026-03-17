@@ -1,0 +1,26 @@
+# Build artifacts
+*.pdf
+*.html
+*.log
+brief_files/
+brief_debug.tex
+
+# R cache
+analysis/cache/
+.Rproj.user/
+.Rhistory
+.RData
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Environment & credentials
+.env
+
+# macOS
+.DS_Store
+
+# Lock files
+uv.lock

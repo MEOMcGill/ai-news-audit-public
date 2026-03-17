@@ -1,0 +1,22 @@
+corpus,field,kappa_unweighted,kappa_weighted,n,pct_agree,strength,track
+,reproduction_level,0.4095,0.7631,3322,57.5,substantial,2
+,attribution_level,0.4107,0.6992,3322,58.2,substantial,2
+,link_quality,0.5555,0.5555,3322,72.2,moderate,2
+,factual_accuracy,0.3392,0.4713,3322,56.3,moderate,2
+,paywalled_content_reproduced,0.8248,0.8248,3322,92.1,almost perfect,2
+economy EN,knowledge_level,0.3879,0.7348,6044,54.9,substantial,1
+economy EN,citation_type,0.8315,0.8315,6044,92.8,almost perfect,1
+economy EN,accuracy,0.3675,0.3902,6043,52.0,fair,1
+economy EN,canadian_sources_cited,0.8177,0.8177,6044,92.5,almost perfect,1
+economy FR,knowledge_level,0.3576,0.6856,3022,52.7,substantial,1
+economy FR,citation_type,0.8217,0.8217,3022,91.8,almost perfect,1
+economy FR,accuracy,0.3547,0.3753,3022,51.7,fair,1
+economy FR,canadian_sources_cited,0.8179,0.8179,3022,91.8,almost perfect,1
+flagship EN,knowledge_level,0.5647,0.8482,6044,70.6,almost perfect,1
+flagship EN,citation_type,0.7231,0.7231,6044,93.3,substantial,1
+flagship EN,accuracy,0.3846,0.5766,6044,52.5,moderate,1
+flagship EN,canadian_sources_cited,0.8289,0.8289,6044,96.7,almost perfect,1
+flagship FR,knowledge_level,0.4351,0.7349,3024,58.6,substantial,1
+flagship FR,citation_type,0.7167,0.7167,3024,94.3,substantial,1
+flagship FR,accuracy,0.3622,0.4876,3024,51.8,moderate,1
+flagship FR,canadian_sources_cited,0.778,0.778,3024,96.0,substantial,1

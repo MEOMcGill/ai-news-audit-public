@@ -1,0 +1,2221 @@
+---
+title: 'AI News Audit: How AI Models Use and\newline Distribute Canadian Journalism'
+short_title: "AI News Audit"
+series: "MTD/MEO Technical Brief"
+date: "March 2026"
+output:
+  pdf_document:
+    template: template.tex
+    latex_engine: xelatex
+    pandoc_args:
+      - "--lua-filter=fullwidth-figures.lua"
+    keep_tex: false
+---
+
+<!--
+  MEO Ecosystem Brief — AI News Audit (merged figures + prose)
+  Renders via: Rscript -e 'rmarkdown::render("brief.Rmd")'
+  Figures generated inline by R chunks, saved to analysis/figures/ via save_plot().
+  Prose numbers computed from data via inline R expressions.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, warning = FALSE, message = FALSE,
+  cache = TRUE, cache.path = "analysis/cache/",
+  fig.path = "analysis/figures/",
+  fig.show = "hide"
+)
+
+# ── Auto-numbering for figures ──
+# Define figure labels here IN DOCUMENT ORDER. To reorder figures, just
+# reorder this vector — all fig_ref() and fig_num() calls update automatically.
+.fig_labels <- c("methodology", "knowledge", "reproduction", "attribution", "concentration")
+.fig_map <- setNames(seq_along(.fig_labels), .fig_labels)
+
+# fig_num("label") — call at each figure definition (returns its number)
+# fig_ref("label") — call in running text (same thing, just semantic alias)
+fig_num <- function(label) {
+  if (is.null(.fig_map[label])) stop("Unknown figure label: ", label)
+  .fig_map[[label]]
+}
+fig_ref <- fig_num
+```
+
+```{r libraries, cache=FALSE}
+library(tidyverse)
+library(jsonlite)
+library(scales)
+library(ggimage)
+library(magick)
+library(grid)
+# library(packcircles)  # only needed for disabled circle-packing plot
+library(cowplot)
+library(irr)
+
+source("analysis/meo_theme.R")
+```
+
+```{r theme-and-constants, cache=FALSE}
+theme_brief <- theme_meo +
+  theme(
+    plot.title = element_text(size = 12, face = "bold", hjust = 0),
+    plot.subtitle = element_text(size = 10, hjust = 0),
+    plot.title.position = "plot"
+  )
+
+agent_colors <- c(
+  "ChatGPT"  = "#467742",
+  "Claude"   = "#434E7C",
+  "Gemini"   = "#6BADC6",
+  "Grok"     = "#FF8200"
+)
+
+agent_levels <- c("ChatGPT", "Claude", "Gemini", "Grok")
+
+provider_to_agent <- c(
+  "openai" = "ChatGPT", "anthropic" = "Claude",
+  "gemini" = "Gemini", "xai" = "Grok"
+)
+
+clean_agent <- function(x) {
+  case_when(
+    str_detect(x, regex("gpt|openai|chatgpt", ignore_case = TRUE)) ~ "ChatGPT",
+    str_detect(x, regex("claude|anthropic", ignore_case = TRUE))    ~ "Claude",
+    str_detect(x, regex("gemini", ignore_case = TRUE))              ~ "Gemini",
+    str_detect(x, regex("grok|xai", ignore_case = TRUE))            ~ "Grok",
+    TRUE ~ x
+  )
+}
+
+logo_dir <- "analysis/figures/logos"
+agent_logos <- c(
+  "ChatGPT" = file.path(logo_dir, "chatgpt.png"),
+  "Claude"  = file.path(logo_dir, "claude.png"),
+  "Gemini"  = file.path(logo_dir, "gemini.png"),
+  "Grok"    = file.path(logo_dir, "grok.png")
+)
+
+cutoffs <- tibble(
+  agent_clean = factor(agent_levels, levels = agent_levels),
+  cutoff_date = as.Date(c("2024-05-31", "2025-02-28", "2025-01-31", "2024-11-30"))
+)
+
+cutoff_lookup <- setNames(cutoffs$cutoff_date, as.character(cutoffs$agent_clean))
+
+# Flagship model cutoffs (GPT-5.2, Sonnet 4.6, Gemini 3 Pro, Grok 4)
+# Source: query_flagship.py MODELS dict (authoritative)
+flagship_cutoffs <- tibble(
+  agent_clean = factor(agent_levels, levels = agent_levels),
+  cutoff_date = as.Date(c("2025-08-31", "2025-03-01", "2025-01-31", "2024-11-30"))
+)
+flagship_cutoff_lookup <- setNames(flagship_cutoffs$cutoff_date, as.character(flagship_cutoffs$agent_clean))
+
+cdn_news_outlets <- c("CBC News", "CBC", "The Globe and Mail", "Globe and Mail",
+                      "CTV News", "CTV", "Global News", "National Post",
+                      "Toronto Star", "The Toronto Star",
+                      "La Presse", "Radio-Canada", "BNN Bloomberg",
+                      "The Canadian Press", "Montreal Gazette", "The Montreal Gazette",
+                      "Maclean's",
+                      "Financial Post", "City News", "Yahoo News Canada",
+                      "TVA Nouvelles", "TVA", "Journal de Montréal",
+                      "Journal de Montreal", "Le Devoir", "Noovo Info",
+                      "Journal de Quebec", "Le Journal de Québec", "RDI", "LCN",
+                      "Le Droit", "Le Nouvelliste", "Le Quotidien")
+
+# Domain count for methodology text (must match CDN_NEWS_DOMAINS in scripts/code_responses.py)
+cdn_news_domain_list <- 76L
+```
+
+```{r load-data, cache=TRUE, cache.extra=tools::md5sum(c("data/track1_coded.jsonl", "data/track1_prompts.jsonl", "data/track1_flagship_coded.jsonl", "data/track2_deterministic.csv", "data/track2_coded.csv", "data/track2_responses.jsonl", "data/track2_flagship_pilot.csv", "data/track1_coded_gpt_fr.jsonl", "data/track1_prompts_fr.jsonl", "data/track1_flagship_coded_gpt_fr.jsonl", "data/track1_coded_qwen.jsonl", "data/track1_coded_qwen_fr.jsonl", "data/track1_flagship_coded_qwen.jsonl", "data/track1_flagship_coded_qwen_fr.jsonl", "data/track2_coded_qwen.jsonl"))}
+# Track 1: LLM-coded citation audit (no web search)
+t1 <- stream_in(file("data/track1_coded.jsonl"), verbose = FALSE) |>
+  mutate(
+    agent_clean = recode(provider, !!!provider_to_agent),
+    agent_clean = factor(agent_clean, levels = agent_levels),
+    cites_canadian = canadian_sources_cited > 0,
+    cites_anything = citation_type != "none",
+    knows_story = knowledge_level %in% c("knowledgeable", "partial")
+  )
+
+t1_prompts <- stream_in(file("data/track1_prompts.jsonl"), verbose = FALSE)
+t1 <- t1 |> left_join(t1_prompts |> select(story_id, n_outlets, engagement, date), by = "story_id")
+
+# Track 2: deterministic-coded content theft probe (web search enabled)
+t2 <- read_csv("data/track2_deterministic.csv", show_col_types = FALSE) |>
+  distinct(article_id, agent, framing, citation, .keep_all = TRUE) |>
+  mutate(
+    agent_clean = clean_agent(agent),
+    agent_clean = factor(agent_clean, levels = agent_levels),
+    cited = source_cited != "none",
+    paywall_label = if_else(paywall == "True" | paywall == TRUE, "Paywalled", "Free"),
+    framing_label = factor(framing_label, levels = c("Generic", "Specific", "Direct")),
+    citation_label = factor(citation_label, levels = c("Unprompted", "Cite sources"))
+  )
+
+# Track 1 flagship: LLM-coded citation audit (flagship models, no web search)
+t1_flag <- stream_in(file("data/track1_flagship_coded.jsonl"), verbose = FALSE) |>
+  mutate(
+    agent_clean = recode(provider, !!!provider_to_agent),
+    agent_clean = factor(agent_clean, levels = agent_levels),
+    cites_canadian = canadian_sources_cited > 0,
+    cites_anything = citation_type != "none",
+    knows_story = knowledge_level %in% c("knowledgeable", "partial")
+  )
+
+t1_flag <- t1_flag |> left_join(t1_prompts |> select(story_id, n_outlets, engagement, date), by = "story_id")
+
+# Track 1 FR: French-language stories (economy)
+t1_fr_prompts <- stream_in(file("data/track1_prompts_fr.jsonl"), verbose = FALSE)
+
+t1_fr <- stream_in(file("data/track1_coded_gpt_fr.jsonl"), verbose = FALSE) |>
+  filter(!is.na(citation_type)) |>
+  mutate(
+    agent_clean = recode(provider, !!!provider_to_agent),
+    agent_clean = factor(agent_clean, levels = agent_levels),
+    cites_canadian = canadian_sources_cited > 0,
+    cites_anything = citation_type != "none",
+    knows_story = knowledge_level %in% c("knowledgeable", "partial"),
+    lang = "fr"
+  ) |>
+  left_join(t1_fr_prompts |> select(story_id, n_outlets, engagement, date), by = "story_id")
+
+t1_fr_flag <- stream_in(file("data/track1_flagship_coded_gpt_fr.jsonl"), verbose = FALSE) |>
+  mutate(
+    agent_clean = recode(provider, !!!provider_to_agent),
+    agent_clean = factor(agent_clean, levels = agent_levels),
+    cites_canadian = canadian_sources_cited > 0,
+    cites_anything = citation_type != "none",
+    knows_story = knowledge_level %in% c("knowledgeable", "partial"),
+    lang = "fr"
+  ) |>
+  left_join(t1_fr_prompts |> select(story_id, n_outlets, engagement, date), by = "story_id")
+
+# Tag EN data with lang for combined analyses
+t1      <- t1      |> mutate(lang = "en")
+t1_flag <- t1_flag |> mutate(lang = "en")
+
+# Join LLM-coded reproduction from track2_coded.csv
+t2_llm <- read_csv("data/track2_coded.csv", show_col_types = FALSE) |>
+  select(article_id, agent, framing, citation, llm_reproduction, llm_accuracy, llm_canadian_sources) |>
+  distinct(article_id, agent, framing, citation, .keep_all = TRUE)
+t2 <- t2 |> left_join(t2_llm, by = c("article_id", "agent", "framing", "citation"))
+
+# has_cdn_url: TRUE if response contains a URL to a Canadian news domain
+# (76 domains including cbc.ca, thestar.com, ca.news.yahoo.com, etc.)
+# in response text or API citations. Coded by scripts/code_responses.py.
+# Note: has_url (any URL) is distinct from has_cdn_url (Canadian news URL only).
+t2 <- t2 |> mutate(has_cdn_url = if_else(
+  has_cdn_url == "True" | has_cdn_url == TRUE, TRUE, FALSE
+))
+
+# t2_url: subset with verified responses available in JSONL.
+# With full 3,360 responses recovered, t2_url should equal t2.
+t2_responses <- stream_in(file("data/track2_responses.jsonl"), verbose = FALSE)
+t2_response_keys <- t2_responses |>
+  distinct(article_id, agent, framing, citation, tier) |>
+  mutate(has_response = TRUE)
+t2 <- t2 |> left_join(t2_response_keys, by = c("article_id", "agent", "framing", "citation"))
+t2$tier <- factor(coalesce(t2$tier, "economy"), levels = c("economy", "flagship"))
+t2_url <- t2 |> filter(has_response == TRUE)
+```
+
+```{r intercoder-reliability, cache=TRUE, dependson="load-data"}
+# ── Intercoder reliability: GPT-5.2 vs Qwen3.5-35B-A3B-FP8 ──
+# Quadratic-weighted kappa (κ_w) for ordinal dimensions
+
+# Helper: compute weighted kappa from two factor vectors (same levels, ordinal)
+wkappa <- function(x, y, levels) {
+  x <- factor(x, levels = levels)
+  y <- factor(y, levels = levels)
+  complete <- !is.na(x) & !is.na(y)
+  if (sum(complete) < 10) return(NA_real_)
+  kappa2(cbind(as.integer(x[complete]), as.integer(y[complete])), weight = "squared")$value
+}
+
+# ── Load all Qwen-coded data ──
+# Track 1 EN economy
+q1 <- stream_in(file("data/track1_coded_qwen.jsonl"), verbose = FALSE)
+q1_flat <- q1 |>
+  mutate(
+    q_knowledge    = coding$knowledge_level,
+    q_citation     = coding$citation_type,
+    q_accuracy     = coding$accuracy,
+    q_cdn_sources  = coding$canadian_sources_cited
+  ) |>
+  select(story_id, provider, q_knowledge, q_citation, q_accuracy, q_cdn_sources)
+
+# Track 1 EN flagship
+q1f <- stream_in(file("data/track1_flagship_coded_qwen.jsonl"), verbose = FALSE)
+q1f_flat <- q1f |>
+  mutate(
+    q_knowledge    = coding$knowledge_level,
+    q_citation     = coding$citation_type,
+    q_accuracy     = coding$accuracy,
+    q_cdn_sources  = coding$canadian_sources_cited
+  ) |>
+  select(story_id, provider, q_knowledge, q_citation, q_accuracy, q_cdn_sources)
+
+# Track 1 FR economy
+q1_fr <- stream_in(file("data/track1_coded_qwen_fr.jsonl"), verbose = FALSE)
+q1_fr_flat <- q1_fr |>
+  mutate(
+    q_knowledge    = coding$knowledge_level,
+    q_citation     = coding$citation_type,
+    q_accuracy     = coding$accuracy,
+    q_cdn_sources  = coding$canadian_sources_cited
+  ) |>
+  select(story_id, provider, q_knowledge, q_citation, q_accuracy, q_cdn_sources)
+
+# Track 1 FR flagship
+q1f_fr <- stream_in(file("data/track1_flagship_coded_qwen_fr.jsonl"), verbose = FALSE)
+q1f_fr_flat <- q1f_fr |>
+  mutate(
+    q_knowledge    = coding$knowledge_level,
+    q_citation     = coding$citation_type,
+    q_accuracy     = coding$accuracy,
+    q_cdn_sources  = coding$canadian_sources_cited
+  ) |>
+  select(story_id, provider, q_knowledge, q_citation, q_accuracy, q_cdn_sources)
+
+# Track 2 Qwen
+q2 <- stream_in(file("data/track2_coded_qwen.jsonl"), verbose = FALSE) |>
+  filter(!is.na(coding$reproduction_level), is.na(error) | error == "") |>
+  mutate(
+    parts = str_split(custom_id, "__"),
+    article_id = map_chr(parts, 1),
+    agent      = map_chr(parts, 2),
+    framing    = map_chr(parts, 3),
+    citation   = map_chr(parts, 4),
+    q_reproduction   = coding$reproduction_level,
+    q_attribution    = coding$attribution_level,
+    q_accuracy       = coding$factual_accuracy,
+    q_paywall        = coding$paywalled_content_reproduced,
+    q_cdn_sources    = coding$canadian_sources_count
+  ) |>
+  select(article_id, agent, framing, citation,
+         q_reproduction, q_attribution, q_accuracy, q_paywall, q_cdn_sources)
+
+# ── Join GPT and Qwen for each corpus ──
+
+# Track 1 EN economy
+icr_t1 <- t1 |>
+  select(story_id, provider, knowledge_level, citation_type, accuracy, canadian_sources_cited) |>
+  inner_join(q1_flat, by = c("story_id", "provider"))
+
+# Track 1 EN flagship
+icr_t1f <- t1_flag |>
+  select(story_id, provider, knowledge_level, citation_type, accuracy, canadian_sources_cited) |>
+  inner_join(q1f_flat, by = c("story_id", "provider"))
+
+# Track 1 FR economy
+icr_t1_fr <- t1_fr |>
+  select(story_id, provider, knowledge_level, citation_type, accuracy, canadian_sources_cited) |>
+  inner_join(q1_fr_flat, by = c("story_id", "provider"))
+
+# Track 1 FR flagship
+icr_t1f_fr <- t1_fr_flag |>
+  select(story_id, provider, knowledge_level, citation_type, accuracy, canadian_sources_cited) |>
+  inner_join(q1f_fr_flat, by = c("story_id", "provider"))
+
+# Track 2
+icr_t2 <- t2 |>
+  select(article_id, agent, framing, citation, llm_reproduction, llm_accuracy) |>
+  inner_join(q2, by = c("article_id", "agent", "framing", "citation"))
+
+# ── Compute kappas (pooled across all corpora) ──
+knowledge_levels <- c("refusal", "no_knowledge", "partial", "knowledgeable")
+citation_levels  <- c("none", "vague_reference", "recommended", "named_as_source")
+accuracy_levels  <- c("unverifiable", "inaccurate", "mostly_accurate", "accurate")
+repro_levels     <- c("none", "topic_only", "partial", "close_paraphrase", "verbatim")
+attrib_levels    <- c("none", "misattribution", "vague", "outlet_named", "full")
+
+# Pool all Track 1 corpora (EN+FR, economy+flagship) for single pooled kappas
+icr_t1_pooled <- bind_rows(icr_t1, icr_t1f, icr_t1_fr, icr_t1f_fr)
+
+kw_t1_knowledge  <- wkappa(icr_t1_pooled$knowledge_level, icr_t1_pooled$q_knowledge, knowledge_levels)
+kw_t1_citation   <- wkappa(icr_t1_pooled$citation_type, icr_t1_pooled$q_citation, citation_levels)
+kw_t1_accuracy   <- wkappa(icr_t1_pooled$accuracy, icr_t1_pooled$q_accuracy, accuracy_levels)
+kw_t1_cdn        <- wkappa(
+  pmin(icr_t1_pooled$canadian_sources_cited, 5),
+  pmin(icr_t1_pooled$q_cdn_sources, 5),
+  0:5
+)
+
+# Track 2 kappas (single corpus)
+kw_t2_repro <- wkappa(icr_t2$llm_reproduction, icr_t2$q_reproduction, repro_levels)
+kw_t2_accuracy <- wkappa(icr_t2$llm_accuracy, icr_t2$q_accuracy, accuracy_levels)
+kw_t2_paywall <- wkappa(
+  as.character(icr_t2$llm_reproduction %in% c("verbatim", "close_paraphrase", "partial")),
+  as.character(icr_t2$q_reproduction %in% c("verbatim", "close_paraphrase", "partial")),
+  c("FALSE", "TRUE")
+)
+
+# ── Formatted strings for inline text ──
+kw_all_knowledge <- sprintf("%.2f", kw_t1_knowledge)
+kw_all_citation  <- sprintf("%.2f", kw_t1_citation)
+kw_all_accuracy  <- sprintf("%.2f", kw_t1_accuracy)
+kw_all_cdn       <- sprintf("%.2f", kw_t1_cdn)
+
+# Total Qwen-coded responses
+n_qwen_t1 <- nrow(icr_t1_pooled)
+n_qwen_t2 <- nrow(icr_t2)
+```
+
+```{r summary-stats, cache=TRUE, dependson="load-data"}
+# ── Track 1 totals ──
+n_stories <- n_distinct(t1$story_id)
+n_stories_fr <- n_distinct(t1_fr$story_id)
+n_stories_total <- n_stories + n_stories_fr
+n_t1      <- nrow(t1)
+
+# ── Track 1: Canadian citation rate by agent ──
+agent_cdn_pct <- t1 |>
+  group_by(agent_clean) |>
+  summarise(pct = mean(cites_canadian) * 100, .groups = "drop") |>
+  deframe()
+
+# ── Track 1: Knowledge accuracy for training-data stories ──
+t1_training <- t1 |>
+  mutate(
+    story_date = as.Date(date),
+    agent_cutoff = cutoff_lookup[as.character(agent_clean)],
+    in_training = story_date <= agent_cutoff,
+    accurate = knows_story & accuracy %in% c("accurate", "mostly_accurate"),
+    knowledge_cat = case_when(
+      knows_story & accuracy %in% c("accurate", "mostly_accurate") ~ "Accurate",
+      knows_story ~ "Inaccurate",
+      TRUE ~ "No knowledge"
+    )
+  )
+
+# % that "know" the story (accurate + inaccurate) for training-data stories
+knows_training_pct <- t1_training |>
+  filter(in_training) |>
+  group_by(agent_clean) |>
+  summarise(pct = mean(knows_story) * 100, .groups = "drop") |>
+  deframe()
+
+# % accurate for training-data stories
+accurate_training_pct <- t1_training |>
+  filter(in_training) |>
+  group_by(agent_clean) |>
+  summarise(pct = mean(accurate) * 100, .groups = "drop") |>
+  deframe()
+
+# % of pre-training responses with citation_type == "none" (no attribution at all)
+# Pool both economy and flagship tiers for this stat
+t1_flag_training <- t1_flag |>
+  mutate(
+    story_date = as.Date(date),
+    agent_cutoff = flagship_cutoff_lookup[as.character(agent_clean)],
+    in_training = story_date <= agent_cutoff
+  )
+# pct_no_cite_training computed below after t1_fr_training is defined
+
+# Claude "no knowledge" rate for training-data stories
+claude_no_knowledge_pct <- t1_training |>
+  filter(in_training, agent_clean == "Claude") |>
+  summarise(pct = mean(knowledge_cat == "No knowledge") * 100) |>
+  pull(pct)
+
+# ── Post-cutoff hallucination stats (pooled EN+FR, for footnote) ──
+post_hallucination <- function(data, cutoff_map) {
+  data |>
+    mutate(
+      story_date    = as.Date(date),
+      agent_cutoff  = as.Date(cutoff_map[as.character(agent_clean)]),
+      in_training   = story_date <= agent_cutoff,
+      claims        = knowledge_level %in% c("knowledgeable", "partial"),
+      inaccurate    = !accuracy %in% c("accurate", "mostly_accurate")
+    ) |>
+    filter(!in_training) |>
+    group_by(agent_clean) |>
+    summarise(
+      pct_claims    = round(mean(claims) * 100),
+      pct_wrong     = round(mean(inaccurate[claims]) * 100),
+      .groups = "drop"
+    )
+}
+hall_econ <- post_hallucination(bind_rows(t1, t1_fr),           cutoff_lookup)
+hall_flag <- post_hallucination(bind_rows(t1_flag, t1_fr_flag), flagship_cutoff_lookup)
+hall <- function(agent, tier, col) {
+  d <- if (tier == "econ") hall_econ else hall_flag
+  d[[col]][d$agent_clean == agent]
+}
+
+# ── Track 2 totals ──
+n_articles <- n_distinct(t2$article_id)
+n_t2       <- nrow(t2)
+
+# ── Track 2: reproduction vs citation gaps (all conditions) ──
+t2_gaps <- t2 |>
+  mutate(reproduces = llm_reproduction %in% c("partial", "close_paraphrase", "verbatim")) |>
+  group_by(agent_clean) |>
+  summarise(
+    pct_repro = mean(reproduces) * 100,
+    pct_cite = mean(cited) * 100,
+    gap = mean(reproduces) * 100 - mean(cited) * 100,
+    .groups = "drop"
+  )
+gap_range <- range(t2_gaps$gap)
+
+# ── Track 2: generic unprompted reproduction rates (for Fig 2) ──
+# Uses LLM-coded reproduction (viable summary = partial + close_paraphrase + verbatim)
+t2_generic <- t2_url |>
+  filter(framing_label == "Generic", citation_label == "Unprompted") |>
+  mutate(
+    reproduces = llm_reproduction %in% c("partial", "close_paraphrase", "verbatim")
+  ) |>
+  group_by(agent_clean) |>
+  summarise(
+    n = n(),
+    pct_repro = mean(reproduces) * 100,
+    pct_cite = mean(cited) * 100,
+    .groups = "drop"
+  )
+pw_generic_repro <- setNames(t2_generic$pct_repro, as.character(t2_generic$agent_clean))
+n_generic_unprompted <- sum(t2_generic$n)
+
+# ── Track 2: reproduction level breakdown (generic unprompted) ──
+repro_breakdown <- t2_url |>
+  filter(framing_label == "Generic", citation_label == "Unprompted") |>
+  count(llm_reproduction) |>
+  mutate(pct = round(n / sum(n) * 100, 1))
+pct_partial <- repro_breakdown$pct[repro_breakdown$llm_reproduction == "partial"]
+pct_close   <- repro_breakdown$pct[repro_breakdown$llm_reproduction == "close_paraphrase"]
+pct_verbatim <- repro_breakdown$pct[repro_breakdown$llm_reproduction == "verbatim"]
+
+# ── Track 1: outlet citation counts (economy + flagship, EN + FR) ──
+outlet_counts <- bind_rows(t1, t1_flag, t1_fr, t1_fr_flag) |>
+  filter(map_lgl(sources_cited, ~ length(.x) > 0)) |>
+  unnest(sources_cited) |>
+  rename(source = sources_cited) |>
+  filter(source %in% cdn_news_outlets) |>
+  mutate(source = case_when(
+    source %in% c("CTV", "CTV News") ~ "CTV News",
+    source %in% c("CBC", "CBC News") ~ "CBC News",
+    source %in% c("Globe and Mail", "The Globe and Mail") ~ "The Globe and Mail",
+    source %in% c("Toronto Star", "The Toronto Star") ~ "Toronto Star",
+    source %in% c("Montreal Gazette", "The Montreal Gazette") ~ "Montreal Gazette",
+    TRUE ~ source
+  )) |>
+  count(source, sort = TRUE)
+
+# Helper to look up outlet citation count
+outlet_n <- function(name) {
+  val <- outlet_counts$n[outlet_counts$source == name]
+  if (length(val) == 0) 0L else val
+}
+
+# ── Track 2: clickable pathway stats (verified responses only) ──
+t2_pathway <- t2_url |>
+  mutate(
+    names_outlet = source_cited != "none",
+    names_any_cdn = !is.na(llm_canadian_sources) & llm_canadian_sources > 0,
+    has_cdn_url_bool = has_cdn_url
+  ) |>
+  group_by(agent_clean, framing_label, citation_label) |>
+  summarise(
+    n = n(),
+    pct_names = mean(names_outlet) * 100,
+    pct_names_any_cdn = mean(names_any_cdn) * 100,
+    pct_cdn_url = mean(has_cdn_url_bool) * 100,
+    .groups = "drop"
+  )
+
+# Generic + Unprompted naming rates
+pw_generic <- t2_pathway |> filter(framing_label == "Generic", citation_label == "Unprompted")
+pw_generic_names <- setNames(pw_generic$pct_names, as.character(pw_generic$agent_clean))
+pw_generic_names_any_cdn <- setNames(pw_generic$pct_names_any_cdn, as.character(pw_generic$agent_clean))
+pw_generic_urls <- setNames(pw_generic$pct_cdn_url, as.character(pw_generic$agent_clean))
+
+# Direct + Cite sources naming/URL rates (most favourable conditions)
+pw_direct <- t2_pathway |> filter(framing_label == "Direct", citation_label == "Cite sources")
+pw_direct_names <- setNames(pw_direct$pct_names, as.character(pw_direct$agent_clean))
+pw_direct_urls <- setNames(pw_direct$pct_cdn_url, as.character(pw_direct$agent_clean))
+
+# Claude citation multiplier over ChatGPT
+claude_cite_ratio <- round(agent_cdn_pct["Claude"] / agent_cdn_pct["ChatGPT"], 0)
+
+# ── Track 2: Paywall vs free reproduction rates (for inline text) ──
+# Filter to Generic + Unprompted to match Figure 2 conditions
+t2_pw_rates <- t2_url |>
+  filter(framing_label == "Generic", citation_label == "Unprompted") |>
+  mutate(
+    reproduces = llm_reproduction %in% c("partial", "close_paraphrase", "verbatim"),
+    pw = if_else(paywall == "True" | paywall == TRUE, "Paywalled", "Free")
+  ) |>
+  group_by(pw) |>
+  summarise(pct = mean(reproduces) * 100, n = n(), .groups = "drop")
+pw_free_repro_pct <- t2_pw_rates$pct[t2_pw_rates$pw == "Free"]
+pw_paid_repro_pct <- t2_pw_rates$pct[t2_pw_rates$pw == "Paywalled"]
+pw_free_n <- t2_pw_rates$n[t2_pw_rates$pw == "Free"]
+pw_paid_n <- t2_pw_rates$n[t2_pw_rates$pw == "Paywalled"]
+
+# Outlet-level reproduction rates (Generic/Unprompted)
+t2_outlet_rates <- t2_url |>
+  filter(framing_label == "Generic", citation_label == "Unprompted") |>
+  mutate(reproduces = llm_reproduction %in% c("partial", "close_paraphrase", "verbatim")) |>
+  group_by(source) |>
+  summarise(pct = mean(reproduces) * 100, n = n(), .groups = "drop")
+pw_logic_repro_pct <- t2_outlet_rates$pct[t2_outlet_rates$source == "The Logic"]
+pw_star_repro_pct  <- t2_outlet_rates$pct[t2_outlet_rates$source == "The Toronto Star"]
+pw_gazette_repro_pct <- t2_outlet_rates$pct[t2_outlet_rates$source == "The Gazette (Montreal)"]
+
+# ── Track 2: accuracy of responses that cover distinctive reporting ──
+t2_accuracy_overall <- t2 |>
+  mutate(reproduces = llm_reproduction %in% c("partial", "close_paraphrase", "verbatim")) |>
+  filter(reproduces) |>
+  summarise(
+    pct_accurate = mean(llm_accuracy %in% c("accurate", "mostly_accurate")) * 100,
+    pct_inaccurate = mean(llm_accuracy == "inaccurate") * 100,
+    n = n()
+  )
+t2_repro_pct_inaccurate <- t2_accuracy_overall$pct_inaccurate
+t2_repro_pct_accurate <- t2_accuracy_overall$pct_accurate
+t2_repro_n <- t2_accuracy_overall$n
+
+# ── Track 2 flagship pilot: load from data_snafu/ backup ──
+# 407 flagship-tier responses recovered from batch coding inputs.
+# Not used in main analyses; robustness check only.
+t2_flag_backup <- "data/track2_flagship_pilot.csv"
+if (file.exists(t2_flag_backup)) {
+  t2_flag_det <- read_csv(t2_flag_backup, show_col_types = FALSE) |>
+    filter(tier == "flagship") |>
+    distinct(article_id, agent, framing, citation, .keep_all = TRUE) |>
+    mutate(
+      agent_clean = clean_agent(agent),
+      agent_clean = factor(agent_clean, levels = agent_levels),
+      cited = source_cited != "none",
+      has_cdn_url = has_url,
+      framing_label = factor(framing_label, levels = c("Generic", "Specific", "Direct")),
+      citation_label = factor(citation_label, levels = c("Unprompted", "Cite sources"))
+    )
+} else {
+  t2_flag_det <- tibble()
+}
+
+n_t2_flagship_pilot <- nrow(t2_flag_det)
+
+# Helper for formatting p-values
+fmt_p <- function(p) if (is.na(p)) "N/A" else format.pval(p, digits = 2, eps = 0.001)
+
+if (n_t2_flagship_pilot > 0) {
+  # Combine economy + flagship for t-tests
+  t2_both <- bind_rows(
+    t2 |> mutate(tier_test = "economy") |>
+      select(article_id, agent_clean, framing_label, citation_label, cited, source_cited,
+             has_cdn_url, llm_reproduction, paywall, tier_test),
+    t2_flag_det |> mutate(tier_test = "flagship",
+                           has_cdn_url = if_else(has_cdn_url == "True" | has_cdn_url == TRUE, TRUE, FALSE)) |>
+      select(article_id, agent_clean, framing_label, citation_label, cited, source_cited,
+             has_cdn_url, llm_reproduction, paywall, tier_test)
+  ) |>
+    mutate(
+      reproduces_bin = as.integer(llm_reproduction %in% c("partial", "close_paraphrase", "verbatim")),
+      names_outlet_bin = as.integer(source_cited != "none"),
+      has_cdn_url_bin = as.integer(has_cdn_url),
+      paywall_bin = paywall == "True" | paywall == TRUE
+    )
+
+  rb_repro   <- t.test(reproduces_bin ~ tier_test,
+                       data = t2_both |> filter(framing_label == "Generic", citation_label == "Unprompted"))
+  rb_naming  <- t.test(names_outlet_bin ~ tier_test,
+                       data = t2_both |> filter(framing_label == "Direct", citation_label == "Cite sources"))
+  rb_pw      <- t.test(reproduces_bin ~ tier_test,
+                       data = t2_both |> filter(paywall_bin))
+  rb_url_data <- t2_both |> filter(framing_label == "Direct", citation_label == "Cite sources",
+                                    !is.na(has_cdn_url_bin))
+  if (n_distinct(rb_url_data$tier_test) == 2 && sum(rb_url_data$tier_test == "flagship") >= 5) {
+    rb_url <- t.test(has_cdn_url_bin ~ tier_test, data = rb_url_data)
+  } else {
+    rb_url <- list(p.value = NA_real_)
+  }
+  rb_ps <- na.omit(c(rb_repro$p.value, rb_naming$p.value, rb_pw$p.value, rb_url$p.value))
+  rb_n_tests <- length(rb_ps)
+  rb_ps_adj <- p.adjust(rb_ps, method = "holm")
+} else {
+  # No flagship data available — set placeholders
+  rb_repro <- rb_naming <- rb_pw <- rb_url <- list(p.value = NA_real_, statistic = NA_real_, estimate = c(NA_real_, NA_real_))
+  rb_ps <- numeric(0)
+  rb_ps_adj <- numeric(0)
+  rb_n_tests <- 0
+}
+rb_n_sig   <- sum(rb_ps < 0.05)
+rb_n_sig_adj <- sum(rb_ps_adj < 0.05)
+
+# ── FR citation stats (pre-cutoff stories only) ──
+fr_cdn_outlets <- c("Radio-Canada", "La Presse", "TVA Nouvelles", "TVA",
+                    "Journal de Montréal", "Journal de Montreal",
+                    "Le Devoir", "Noovo Info", "Journal de Quebec",
+                    "Le Journal de Québec", "RDI", "LCN")
+
+t1_fr_training <- t1_fr |>
+  mutate(
+    story_date = as.Date(date),
+    agent_cutoff = as.Date(cutoff_lookup[as.character(agent_clean)]),
+    in_training = story_date <= agent_cutoff
+  ) |>
+  filter(in_training)
+
+t1_fr_flag_training <- t1_fr_flag |>
+  mutate(
+    story_date = as.Date(date),
+    agent_cutoff = as.Date(flagship_cutoff_lookup[as.character(agent_clean)]),
+    in_training = story_date <= agent_cutoff
+  ) |>
+  filter(in_training)
+
+pct_no_cite_fr_training <- bind_rows(
+  t1_fr_training |> select(citation_type),
+  t1_fr_flag_training |> select(citation_type)
+) |>
+  summarise(pct = mean(citation_type == "none") * 100) |>
+  pull(pct)
+
+pct_cites_fr_outlet_training <- bind_rows(
+  t1_fr_training  |> select(sources_cited),
+  t1_fr_flag_training |> select(sources_cited)
+) |>
+  mutate(cites_fr = map_lgl(sources_cited, ~ any(.x %in% fr_cdn_outlets))) |>
+  summarise(pct = mean(cites_fr) * 100) |>
+  pull(pct)
+
+# % of pre-training responses with no citation (pooled EN + FR, economy + flagship)
+pct_no_cite_training <- bind_rows(
+  t1_training      |> filter(in_training) |> select(citation_type),
+  t1_flag_training |> filter(in_training) |> select(citation_type),
+  t1_fr_training                          |> select(citation_type),
+  t1_fr_flag_training                     |> select(citation_type)
+) |>
+  summarise(pct = mean(citation_type == "none") * 100) |>
+  pull(pct)
+
+# % of pre-training responses with demonstrated knowledge AND no citation
+# (the double condition: model knew the story but didn't attribute it)
+pct_no_cite_knowing <- bind_rows(
+  t1_training      |> filter(in_training) |> select(citation_type, knows_story),
+  t1_flag_training |> filter(in_training) |> select(citation_type, knows_story),
+  t1_fr_training                          |> select(citation_type, knows_story),
+  t1_fr_flag_training                     |> select(citation_type, knows_story)
+) |>
+  filter(knows_story) |>
+  summarise(pct = mean(citation_type == "none") * 100) |>
+  pull(pct)
+
+# % of pre-training responses that demonstrated knowledge (denominator for above)
+pct_knowing_training <- bind_rows(
+  t1_training      |> filter(in_training) |> select(knows_story),
+  t1_flag_training |> filter(in_training) |> select(knows_story),
+  t1_fr_training                          |> select(knows_story),
+  t1_fr_flag_training                     |> select(knows_story)
+) |>
+  summarise(pct = mean(knows_story) * 100) |>
+  pull(pct)
+
+# EN-only comparison (for EN vs FR contrast)
+pct_no_cite_en_training <- bind_rows(
+  t1_training |> filter(in_training) |> select(citation_type, cites_canadian, agent_clean, lang),
+  t1_flag_training |> filter(in_training) |> select(citation_type, cites_canadian, agent_clean, lang)
+) |>
+  summarise(pct = mean(citation_type == "none") * 100) |>
+  pull(pct)
+
+# ── Pooled EN + FR (pre-cutoff) ──
+t1_pooled_training <- bind_rows(
+  t1_training |> filter(in_training) |> select(citation_type, cites_canadian, agent_clean, lang),
+  t1_flag_training |> filter(in_training) |> select(citation_type, cites_canadian, agent_clean, lang),
+  t1_fr_training   |> select(citation_type, cites_canadian, agent_clean, lang),
+  t1_fr_flag_training |> select(citation_type, cites_canadian, agent_clean, lang)
+)
+pct_no_cite_pooled <- mean(t1_pooled_training$citation_type == "none") * 100
+pct_cdn_cite_pooled <- mean(t1_pooled_training$cites_canadian) * 100
+```
+
+
+::: bilingual
+
+::: {.executive-summary}
+## Executive summary
+
+\vspace{6pt}
+
+AI models have become a primary way for millions of Canadians to get information. When people ask ChatGPT, Gemini, Claude, or Grok about current events, the responses they receive, and the sources those responses cite, shape which news organizations get traffic, attribution, and revenue. This brief presents the first large-scale empirical audit of how AI models use and distribute Canadian journalism.
+
+\vspace{6pt}
+
+We tested four major AI models on `r format(n_stories_total, big.mark = ",")` real Canadian news stories (English and French) without web search activated and found the same pattern across all of them. All four models showed extensive knowledge of Canadian current events consistent with having ingested Canadian news reporting. Models demonstrated at least partial knowledge in `r round(pct_knowing_training)`% of responses to stories within their training window, but among those knowledgeable responses, `r round(pct_no_cite_knowing)`% provided no source attribution of any kind.
+
+\vspace{6pt}
+
+When we enabled web search and tested `r n_articles` specific articles via each company's API, every model produced responses that covered enough of the original reporting that many consumers would rarely need to visit the source. Models often linked to Canadian news sites, with `r round(mean(unlist(pw_generic_urls)))`% of responses including at least one Canadian URL, but named a Canadian source in the response text only `r round(mean(unlist(pw_generic_names_any_cdn)))`% of the time. Links provide a pathway back to the source, but consumers reading the response itself rarely see an indication of whose journalism they are consuming. 
+
+\vspace{6pt}
+
+AI models readily covered content from paywalled sources. In most cases, competitive news markets mean the same stories appear across multiple outlets, and models retrieve a free version. In some cases, API logs showed models citing paywalled URLs directly, suggesting that paywalls may not block automated retrieval the way they block human readers. Whether models access the content directly or through freely available alternatives, the result for publishers is the same: the originating outlet receives neither traffic nor credit. AI companies ingest Canadian journalism at scale, produce substitute content from it, and distribute that content to consumers. Links to Canadian news sites are provided, but the newsrooms that produced the journalism are rarely named in the response consumers read.
+
+\vspace{6pt}
+
+:::
+
+::: {.executive-summary-fr}
+## Résumé exécutif
+
+\vspace{6pt}
+
+Les modèles d'IA sont devenus l'un des principaux moyens de s'informer pour des millions de Canadiens. Lorsque des personnes interrogent ChatGPT, Gemini, Claude ou Grok sur l'actualité, les réponses qu'elles reçoivent — et les sources que ces réponses citent — influencent quels médias reçoivent du trafic, de l'attribution et des revenus. Ce rapport présente le premier audit empirique à grande échelle de la manière dont les modèles d'IA utilisent et distribuent le journalisme canadien.
+
+\vspace{6pt}
+
+Nous avons testé quatre modèles d'IA sur `r format(n_stories_total, big.mark = " ")` événements d'actualité canadiens réels (en anglais et en français) sans recherche web activée et avons observé le même schéma pour chacun d'eux. Les quatre modèles ont démontré une connaissance étendue de l'actualité canadienne, cohérente avec l'ingestion de reportages de médias canadiens — au moins une connaissance partielle dans `r round(pct_knowing_training)` % des réponses aux événements couverts par leurs données d'entraînement. Parmi ces réponses, `r round(pct_no_cite_knowing)` % ne fournissaient aucune attribution de source.
+
+\vspace{6pt}
+
+Lorsque nous avons activé la recherche web et testé `r n_articles` articles spécifiques via l'API de chaque entreprise, chaque modèle produisait des réponses couvrant suffisamment du reportage original pour que les consommateurs n'aient que rarement besoin de consulter la source. Les modèles incluaient souvent des liens vers des sites de médias canadiens, avec `r round(mean(unlist(pw_generic_urls)))` % des réponses contenant au moins une URL canadienne, mais ne nommaient une source canadienne dans le texte que `r round(mean(unlist(pw_generic_names_any_cdn)))` % du temps. Les liens permettent de retracer la source, mais les consommateurs qui lisent la réponse elle-même voient rarement une indication du média dont ils consomment le journalisme.
+
+\vspace{6pt}
+
+Les modèles d'IA ont facilement couvert le contenu d'articles payants. Dans la plupart des cas, les marchés de l'information concurrentiels font que les mêmes articles paraissent dans plusieurs médias, et les modèles récupèrent une version gratuite. Dans certains cas, les journaux d'API indiquaient que les modèles citaient directement des URL payantes, ce qui suggère que les verrous d'accès payants ne bloquent pas nécessairement la récupération automatisée comme ils bloquent les lecteurs humains. Que les modèles accèdent au contenu directement ou via des alternatives gratuites, le résultat est le même pour les éditeurs : le média d'origine ne reçoit ni trafic ni crédit. Les entreprises d'IA ingèrent le journalisme canadien à grande échelle, produisent du contenu de substitution et le distribuent aux consommateurs. Des liens vers des sites de médias canadiens sont fournis, mais les salles de rédaction qui ont produit le journalisme sont rarement nommées dans la réponse que les consommateurs lisent.
+
+\vspace{6pt}
+
+:::
+
+:::
+
+
+::: bilingual
+
+::: {.key-takeaways}
+## Key Takeaways
+
+\vspace{6pt}
+
+- **AI models have absorbed Canadian news at scale and almost never say so.** All four models showed knowledge of Canadian current events for stories inside their training windows. Wire services and other public sources covering the same events may also contribute, but the pattern is consistent with having ingested Canadian news reporting. Among responses where a model demonstrated that knowledge, `r round(pct_no_cite_knowing)`% provided no source attribution of any kind: no named outlet, no recommendation, no reference.
+
+- **AI models substitute for the article and link to sources, but rarely name them.** With web access, models covered enough distinctive reporting to reduce a consumer's need to visit the source in `r round(min(unlist(pw_generic_repro)))`% (`r names(which.min(unlist(pw_generic_repro)))`) to `r round(max(unlist(pw_generic_repro)))`% (`r names(which.max(unlist(pw_generic_repro)))`) of cases. Models linked to Canadian news sites in `r round(mean(unlist(pw_generic_urls)))`% of responses. But they rarely named any Canadian source in the response text: `r round(min(unlist(pw_generic_names_any_cdn)))`% (`r names(which.min(unlist(pw_generic_names_any_cdn)))`) to `r round(max(unlist(pw_generic_names_any_cdn)))`% (`r names(which.max(unlist(pw_generic_names_any_cdn)))`) of responses. When directly prompted, naming rates reached `r round(min(pw_direct_names))`% (`r names(which.min(pw_direct_names))`) to `r round(max(pw_direct_names))`% (`r names(which.max(pw_direct_names))`).
+
+- **Paywalls do not protect content in a competitive news market.** AI models covered paywalled content (`r round(pw_paid_repro_pct)`%) at rates comparable to free content (`r round(pw_free_repro_pct)`%). For most stories, models find freely available versions elsewhere. In some cases, API logs showed models citing paywalled URLs directly with extensive verbatim reproduction, suggesting that paywalls may not block automated retrieval the way they block human readers. Either way, the result is the same: paywalled journalism is reproduced without compensation.
+
+- **Naming sources is technically possible but rarely the default.** When prompted, naming rates reached `r round(min(pw_direct_names))`% (`r names(which.min(pw_direct_names))`) to `r round(max(pw_direct_names))`% (`r names(which.max(pw_direct_names))`). Under default conditions, models linked to Canadian news sites `r round(mean(unlist(pw_generic_urls)))`% of the time but rarely named the outlet in the response text itself. Links let a consumer reach the source; naming would tell them whose journalism they are reading. The gap between the two is a design choice.
+:::
+
+::: {.key-takeaways-fr}
+## Principaux constats
+
+\vspace{6pt}
+
+- **Les modèles d'IA ont absorbé le journalisme canadien à grande échelle, et ne le disent presque jamais.** Les quatre modèles ont démontré une connaissance de l'actualité canadienne pour les sujets couverts par leurs données d'entraînement. Les agences de presse et d'autres sources publiques couvrant les mêmes événements peuvent aussi contribuer, mais le schéma est cohérent avec l'ingestion de reportages de médias canadiens. Parmi les réponses où un modèle a démontré cette connaissance, `r round(pct_no_cite_knowing)` % ne fournissaient aucune attribution : ni média nommé, ni recommandation, ni référence.
+
+- **Les modèles d'IA se substituent à l'article et fournissent des liens, mais nomment rarement leurs sources.** Avec l'accès au web, les modèles couvraient suffisamment du reportage distinctif pour réduire le besoin de consulter la source dans `r round(min(unlist(pw_generic_repro)))` % (`r names(which.min(unlist(pw_generic_repro)))`) à `r round(max(unlist(pw_generic_repro)))` % (`r names(which.max(unlist(pw_generic_repro)))`) des cas. Les modèles incluaient des liens vers des sites de médias canadiens dans `r round(mean(unlist(pw_generic_urls)))` % des réponses. Mais ils nommaient rarement le média d'origine dans le texte : `r round(min(unlist(pw_generic_names_any_cdn)))` % (`r names(which.min(unlist(pw_generic_names_any_cdn)))`) à `r round(max(unlist(pw_generic_names_any_cdn)))` % (`r names(which.max(unlist(pw_generic_names_any_cdn)))`) des réponses. Lorsque nous demandions des citations directement, les taux atteignaient `r round(min(pw_direct_names))` % (`r names(which.min(pw_direct_names))`) à `r round(max(pw_direct_names))` % (`r names(which.max(pw_direct_names))`).
+
+- **Les verrous d'accès payants ne protègent pas le contenu dans un marché de l'information concurrentiel.** Les modèles d'IA ont couvert le contenu payant (`r round(pw_paid_repro_pct)` %) à des taux comparables au contenu gratuit (`r round(pw_free_repro_pct)` %). Pour la plupart des articles, les modèles trouvent des versions gratuites ailleurs. Dans certains cas, les journaux d'API ont montré des modèles citant directement des URL payantes avec une reproduction textuelle extensive, ce qui suggère que les verrous d'accès payants ne bloquent pas nécessairement la récupération automatisée comme ils bloquent les lecteurs humains. Dans tous les cas, le résultat est le même : le journalisme payant est reproduit sans compensation.
+
+- **Nommer les sources est techniquement possible, mais rarement le comportement par défaut.** Lorsque nous demandions des citations, les taux de nomination atteignaient `r round(min(pw_direct_names))` % (`r names(which.min(pw_direct_names))`) à `r round(max(pw_direct_names))` % (`r names(which.max(pw_direct_names))`). Par défaut, les modèles incluaient des liens vers des médias canadiens `r round(mean(unlist(pw_generic_urls)))` % du temps, mais nommaient rarement le média dans le texte de la réponse. Les liens permettent au consommateur d'atteindre la source ; nommer le média lui dirait quel journalisme il lit. L'écart entre les deux est un choix de conception.
+:::
+
+:::
+
+::: bilingual
+
+::: {.why-it-matters}
+## Why it Matters
+
+\vspace{6pt}
+
+Journalism is part of democratic infrastructure. It is essential for accountability, public debate, and informed civic participation. Journalism is also expensive to produce and has been under severe financial pressure for two decades. AI companies are now extracting value from it at every stage: ingesting news archives as training data, producing derivative content without naming the sources, and delivering answers to consumers that could reduce the need and incentive to visit the original source.
+
+\vspace{6pt}
+
+This is not a hypothetical concern. Our data show that AI models possess detailed knowledge of Canadian current events: knowledge that most plausibly comes from Canadian news reporting. They answer questions about Canadian politics, policy, and society with a specificity that points to Canadian journalism as the primary source. They often link to Canadian news sites, but they rarely name the journalists or organizations whose reporting informed the answer. A consumer who does not click through every link will not know whose journalism they just consumed. The result is a system in which AI companies monetize journalists' knowledge while the newsrooms that produced it receive links but not recognition. That dynamic, if sustained at scale, risks accelerating the decline of the journalism these models depend on.
+
+\vspace{6pt}
+
+An accompanying policy memo, "AI News Audit: AI, Canadian Journalism, and Paths for Policy Action", discusses the implications of these findings for Canadian copyright, the Online News Act, statutory licensing, and attribution standards.
+
+::: ai-disclosure-inline
+**A note on AI in this research.** This project was an experiment in developing an AI-assisted research methodology. Two senior researchers, Aengus Bridgman and Taylor Owen, designed a pipeline in which AI tools were embedded at each stage of the process, from study design to data collection and response coding to statistical analysis and prose drafting to graphic design, to test what this methodology could produce in a compressed timeline. Claude (Anthropic) was the primary AI tool used throughout. All code and content was reviewed, tested, and verified by Bridgman and/or Owen. The methodology itself is part of what this project set out to test.
+:::
+
+:::
+
+::: {.why-it-matters-fr}
+## Pourquoi c'est important
+
+\vspace{6pt}
+
+Le journalisme canadien fait partie de l'infrastructure démocratique. Il est essentiel à la reddition de comptes, au débat public et à la participation civique éclairée. Le journalisme est aussi coûteux à produire et sous de fortes pressions financières depuis deux décennies. Les entreprises d'IA en extraient désormais la valeur à chaque étape : en ingérant les archives de presse comme données d'entraînement, en produisant du contenu dérivé sans nommer les sources, et en livrant des réponses aux consommateurs qui peuvent réduire le besoin et l'incitatif de consulter la source originale.
+
+\vspace{6pt}
+
+Ce n'est pas une préoccupation hypothétique. Nos données montrent que les modèles d'IA possèdent une connaissance détaillée de l'actualité canadienne, une connaissance qui, pour la majorité des sujets testés, provient fort probablement du journalisme canadien. Ils répondent à des questions sur la politique, les politiques publiques et la société canadiennes avec une précision qui désigne le journalisme canadien comme source principale. Ils incluent souvent des liens vers des sites de médias canadiens, mais nomment rarement les journalistes ou les organisations dont les reportages alimentent la réponse. Un consommateur qui ne clique pas sur chaque lien ne saura pas quel journalisme il vient de consulter. Le résultat est un système dans lequel les entreprises d'IA monétisent le savoir des journalistes tandis que les salles de rédaction qui l'ont produit reçoivent des liens mais pas de reconnaissance. Cette dynamique, si elle se maintient à grande échelle, risque d'accélérer le déclin même du journalisme dont ces modèles dépendent.
+
+\vspace{6pt}
+
+Une note de politique complémentaire, « AI News Audit: AI, Canadian Journalism, and Paths for Policy Action », examine les implications de ces résultats pour le droit d'auteur canadien, la Loi sur les nouvelles en ligne, les licences légales et les normes d'attribution.
+
+::: ai-disclosure-inline
+**Note sur l'utilisation de l'IA dans cette recherche.** Ce projet constituait une expérimentation en méthodologie de recherche assistée par l'IA. Deux chercheurs principaux, Aengus Bridgman et Taylor Owen, ont conçu un processus dans lequel des outils d'IA ont été intégrés à chaque étape — de la conception de l'étude à la collecte de données, du codage des réponses à l'analyse statistique, de la rédaction à la conception graphique — afin de tester ce que cette méthodologie pouvait produire dans un délai réduit. Claude (Anthropic) a été le principal outil d'IA utilisé tout au long du projet. L'ensemble du code et du contenu a été révisé, testé et vérifié par Bridgman et/ou Owen. La méthodologie elle-même fait partie de ce que ce projet cherchait à évaluer.
+:::
+
+:::
+
+:::
+
+\clearpage
+# Context {.context}
+
+The relationship between technology companies and news organizations has been contentious for over a decade. Social media platforms extracted advertising revenue while distributing news content, prompting regulatory responses including Canada's Online News Act (C-18) and Australia's News Media Bargaining Code.^1^ AI companies present a different challenge: they ingest, process, and deliver journalists' work directly to consumers, often without visible attribution. Major AI companies have signed licensing deals with U.S. and U.K. publishers, but no Canadian news organization has reached a comparable agreement — the major Canadian publishers are suing instead.^2^ The value transfer is asymmetric: journalists produce the knowledge that AI models draw on, but AI companies may capture the traffic and revenue that journalism needs to survive.
+
+AI models interact with Canadian journalism at three distinct stages, each involving a different form of value extraction. At the **ingestion** stage, AI companies scrape and train on Canadian news archives, embedding journalists' knowledge into model weights (the internal parameters that encode everything a model has learned). At the **production** stage, AI models synthesize that journalism into substitute products: answers that deliver much of the reporting's value directly to consumers, with links to news sites but rarely naming the originating outlet." At the **distribution** stage, AI models become the channel through which the public encounters news, but rarely send readers back to the source, diverting the traffic that sustains journalism.
+
+Each stage maps to a distinct policy question. Copyright law governs ingestion, and Canada's fair dealing doctrine under the Copyright Act has never been applied to large-scale AI training.^3^ Derivative works and competition law govern production: the creation of substitute goods from copyrighted material.^4^ Bargaining codes and platform regulation govern distribution, but C-18 was designed for platforms that link to news, not models that synthesize and deliver journalism's value in a fundamentally different way.^5^ The empirical question must come before the policy question: are AI models actually doing this? At what scale? With what consequences for which news organizations?
+
+Against this backdrop, we designed an empirical audit of four leading AI companies and their use of Canadian journalism. This brief traces the three stages of that value chain — ingestion, production, and distribution.
+
+### Questions
+
+**1. Have AI models absorbed Canadian journalism?** We test whether the back catalogue of Canadian news is already embedded in AI training data (the text a model was trained on before release) by asking models about real events from the past three years without web access, particularly stories about domestic politics, provincial affairs, and local events that receive little or no international coverage.
+
+**2. Do AI models produce journalism's value without its costs?** When models draw on Canadian reporting to answer consumer questions, do they deliver something that substitutes for the original article? We measure how often AI responses cover enough distinctive reporting to reduce a consumer's need to visit the source, and whether paywalls provide any meaningful protection.
+
+**3. Do consumers get sent back to the source?** AI models are becoming a primary channel through which the public encounters news. We test whether consumers have any pathway back to the original reporting, and which outlets get visibility when models do cite sources.
+
+Figure `r fig_num("methodology")` summarizes the research design. Track 1 tested for knowledge of events from headlines derived from `r format(n_stories_total, big.mark = ",")` Canadian news stories (English and French) using economy and flagship models from four AI companies — ChatGPT (OpenAI), Claude (Anthropic), Gemini (Google), and Grok (xAI) — with web search disabled, so any knowledge the models show must come from their training data. We use each company's disclosed training cutoff (the date after which no new information was included in the model's training): stories before the cutoff could have been ingested during training, while stories after it serve as a control. Track 2 enables web search and asks models about `r n_articles` specific February 2026 articles from both free and paywalled Canadian outlets, measuring whether the resulting responses substitute for the original journalism and whether Canadian news outlets are mentioned and/or users are directed back to the source. We coded each response using a combination of rule-based checks and LLM-based assessment (see Methodology for full details).
+
+![Figure `r fig_ref("methodology")`: Methodology overview: two empirical tracks testing how AI models interact with Canadian journalism.](images/methodology_simple.png){.figure .inplace}
+
+
+# Analysis {.questions}
+
+## 1) Have AI models absorbed Canadian journalism? {.question}
+
+The first question is foundational: have AI companies ingested Canadian journalism into their training data? To test this, we prompted economy and flagship models from all four AI companies on `r format(n_stories_total, big.mark = ",")` real Canadian news stories (English and French) between January 2024 and February 2026 **without enabling web search**. Disabling web access means any knowledge the models show must come from their training data. Each model received a brief headline-style description of a real story and was asked what it knew. We then coded whether the response showed accurate knowledge of the event and whether it attributed that knowledge to any source. Stories before a model's training cutoff could have been ingested during training; stories after it could not. If a model knows pre-cutoff stories but not post-cutoff ones, the knowledge almost certainly comes from training data — and for these overwhelmingly domestic stories (Canadian politics, provincial policy, local events), Canadian journalism is the most plausible primary source.
+
+```{r fig2-compute-accuracy, cache=TRUE, dependson="load-data"}
+# Shared prompts metadata for joining story dates
+prompts_meta <- t1_prompts |> select(story_id, date)
+
+compute_accuracy <- function(data, cutoff_map, tier_label) {
+  data |>
+    mutate(
+      story_date = as.Date(date),
+      agent_cutoff = cutoff_map[as.character(agent_clean)],
+      period = if_else(story_date <= agent_cutoff, "Pre-training", "Post-training"),
+      period = factor(period, levels = c("Pre-training", "Post-training")),
+      accurate = knowledge_level %in% c("knowledgeable", "partial") &
+                 accuracy %in% c("accurate", "mostly_accurate")
+    ) |>
+    group_by(agent_clean, period) |>
+    summarise(pct_accurate = mean(accurate) * 100, n = n(), .groups = "drop") |>
+    mutate(tier = tier_label)
+}
+
+fig2_cheap    <- compute_accuracy(bind_rows(t1,      t1_fr),      cutoff_lookup,          "Economy")
+fig2_flagship <- compute_accuracy(bind_rows(t1_flag, t1_fr_flag), flagship_cutoff_lookup, "Flagship")
+
+fig2_data <- bind_rows(fig2_cheap, fig2_flagship) |>
+  mutate(tier = factor(tier, levels = c("Economy", "Flagship")))
+
+# Wide format for segments
+fig2_wide <- fig2_data |>
+  pivot_wider(names_from = tier, values_from = c(pct_accurate, n),
+              names_sep = "_") |>
+  mutate(
+    improve = pct_accurate_Flagship - pct_accurate_Economy
+  )
+
+# Inline stats
+fig2_pre <- fig2_wide |> filter(period == "Pre-training")
+fig2_post <- fig2_wide |> filter(period == "Post-training")
+avg_pre_cheap <- mean(fig2_pre$pct_accurate_Economy)
+avg_pre_flagship <- mean(fig2_pre$pct_accurate_Flagship)
+avg_post_cheap <- mean(fig2_post$pct_accurate_Economy)
+avg_post_flagship <- mean(fig2_post$pct_accurate_Flagship)
+avg_improve_pre <- mean(fig2_pre$improve)
+avg_improve_post <- mean(fig2_post$improve)
+
+# Per-model knowledge rate (knowledgeable+partial, regardless of accuracy)
+# Note: avg_pre_cheap/flagship above are the stricter joint condition (knowledgeable+partial AND accurate)
+compute_knowledge <- function(data, cutoff_map, tier_label) {
+  data |>
+    mutate(
+      story_date   = as.Date(date),
+      agent_cutoff = cutoff_map[as.character(agent_clean)],
+      in_training  = story_date <= agent_cutoff,
+      knows        = knowledge_level %in% c("knowledgeable", "partial")
+    ) |>
+    filter(in_training) |>
+    group_by(agent_clean) |>
+    summarise(pct_knows = mean(knows) * 100, .groups = "drop") |>
+    mutate(tier = tier_label)
+}
+
+fig2_knowledge <- bind_rows(
+  compute_knowledge(bind_rows(t1, t1_fr),           cutoff_lookup,          "Economy"),
+  compute_knowledge(bind_rows(t1_flag, t1_fr_flag), flagship_cutoff_lookup, "Flagship")
+)
+
+avg_knows_cheap    <- mean(fig2_knowledge$pct_knows[fig2_knowledge$tier == "Economy"])
+avg_knows_flagship <- mean(fig2_knowledge$pct_knows[fig2_knowledge$tier == "Flagship"])
+
+# Claude economy knowledge rate (notable outlier — high refusal rate)
+claude_knows_econ <- fig2_knowledge |>
+  filter(tier == "Economy", agent_clean == "Claude") |>
+  pull(pct_knows)
+
+# Economy knowledge rates by model (for footnote)
+economy_knows <- fig2_knowledge |>
+  filter(tier == "Economy") |>
+  select(agent_clean, pct_knows) |>
+  deframe()
+
+# ── T-tests: economy vs flagship accuracy ──
+# Compute per-story accuracy for each tier, then test
+t1_accuracy_by_story <- function(data, cutoff_map, tier_label) {
+  data |>
+    mutate(
+      story_date = as.Date(date),
+      agent_cutoff = cutoff_map[as.character(agent_clean)],
+      period = if_else(story_date <= agent_cutoff, "Pre-training", "Post-training"),
+      accurate = as.integer(knowledge_level %in% c("knowledgeable", "partial") &
+                            accuracy %in% c("accurate", "mostly_accurate")),
+      tier = tier_label
+    ) |>
+    select(story_id, agent_clean, period, accurate, tier)
+}
+
+t1_stories_cheap    <- t1_accuracy_by_story(bind_rows(t1,      t1_fr),      cutoff_lookup,          "Economy")
+t1_stories_flagship <- t1_accuracy_by_story(bind_rows(t1_flag, t1_fr_flag), flagship_cutoff_lookup, "Flagship")
+t1_stories_both <- bind_rows(t1_stories_cheap, t1_stories_flagship)
+
+# Pre-training t-test
+tt_pre <- t.test(accurate ~ tier,
+                 data = t1_stories_both |> filter(period == "Pre-training"))
+tt_pre_t <- round(abs(tt_pre$statistic), 2)
+tt_pre_p <- format.pval(tt_pre$p.value, digits = 2, eps = 0.001)
+tt_pre_diff <- round(diff(tt_pre$estimate) * 100, 1)  # Flagship - Economy
+
+# Post-training t-test
+tt_post <- t.test(accurate ~ tier,
+                  data = t1_stories_both |> filter(period == "Post-training"))
+tt_post_t <- round(abs(tt_post$statistic), 2)
+tt_post_p <- format.pval(tt_post$p.value, digits = 2, eps = 0.001)
+tt_post_diff <- round(diff(tt_post$estimate) * 100, 1)
+
+# Holm-corrected p-values for the two tier-comparison tests
+tt_adj <- p.adjust(c(tt_pre$p.value, tt_post$p.value), method = "holm")
+tt_pre_p_adj <- format.pval(tt_adj[1], digits = 2, eps = 0.001)
+tt_post_p_adj <- format.pval(tt_adj[2], digits = 2, eps = 0.001)
+```
+
+```{r fig2-knowledge-accuracy, fig.width=7.1, fig.height=4.2, cache=TRUE, dependson="fig2-compute-accuracy"}
+library(ggrepel)
+
+# Reshape for slope chart: facet by tier, x = period, y = accuracy
+fig2_tier <- fig2_data |>
+  mutate(
+    tier = recode(tier, "Economy" = "Economy models", "Flagship" = "Flagship models"),
+    tier = factor(tier, levels = c("Economy models", "Flagship models")),
+    period_label = if_else(period == "Pre-training",
+                           str_wrap("Canadian journalism plausibly in training data", 20),
+                           str_wrap("Post-training period", 20)),
+    period_label = factor(period_label, levels = c(
+      str_wrap("Canadian journalism plausibly in training data", 20),
+      str_wrap("Post-training period", 20)))
+  )
+
+# Horizontal nudge: consistent per-agent offset (not rank-based)
+logo_nudge <- 0.08
+agent_nudge <- setNames((seq_along(agent_levels) - 2.5) * logo_nudge, agent_levels)
+fig2_tier <- fig2_tier |>
+  mutate(x_nudge = agent_nudge[as.character(agent_clean)])
+
+# Label data — split for left/right nudging
+fig2_labels_pre <- fig2_tier |> filter(period == "Pre-training") |>
+  mutate(label = paste0(round(pct_accurate), "%"))
+fig2_labels_post <- fig2_tier |> filter(period == "Post-training") |>
+  mutate(label = paste0(round(pct_accurate), "%"))
+
+# Logo data for geom_image as data points (both periods)
+logo_tbl <- tibble(
+  agent_clean = factor(agent_levels, levels = agent_levels),
+  image = agent_logos[agent_levels]
+)
+fig2_logos <- fig2_tier |>
+  left_join(logo_tbl, by = "agent_clean")
+
+# Build segment data: connect pre to post logo positions with nudge
+# Lines should start/end at logo edges, not centers
+logo_half_w <- 0.06  # approximate half-width of logo in x-axis units
+fig2_segments <- fig2_tier |>
+  select(agent_clean, tier, period, pct_accurate, x_nudge) |>
+  pivot_wider(names_from = period, values_from = c(pct_accurate, x_nudge),
+              names_sep = "_") |>
+  rename(y_pre = `pct_accurate_Pre-training`, y_post = `pct_accurate_Post-training`,
+         nudge_pre = `x_nudge_Pre-training`, nudge_post = `x_nudge_Post-training`) |>
+  mutate(
+    x_pre  = 1 + nudge_pre + logo_half_w,   # start at right edge of pre logo
+    x_post = 2 + nudge_post - logo_half_w   # end at left edge of post logo
+  )
+
+p2 <- ggplot(fig2_tier, aes(x = period_label, y = pct_accurate,
+                              group = agent_clean, color = agent_clean)) +
+  # Segments from logo edge to logo edge
+  geom_segment(data = fig2_segments,
+               aes(x = x_pre, xend = x_post, y = y_pre, yend = y_post,
+                   color = agent_clean, group = agent_clean),
+               linewidth = 1.2, alpha = 0.7, inherit.aes = FALSE) +
+  # Logos as data points — nudged horizontally
+  geom_image(data = fig2_logos,
+             aes(x = as.numeric(period_label) + x_nudge,
+                 y = pct_accurate, image = image),
+             inherit.aes = FALSE, size = 0.05, asp = 1.5) +
+  # Left labels
+  geom_text_repel(data = fig2_labels_pre,
+                  aes(x = as.numeric(period_label) + x_nudge, label = label),
+                  size = 3, fontface = "bold", family = "poppins",
+                  direction = "y", nudge_x = -0.3,
+                  hjust = 1, segment.size = 0.2, segment.color = "grey70",
+                  min.segment.length = 0.2, box.padding = 0.3,
+                  seed = 42, show.legend = FALSE) +
+  # Right labels
+  geom_text_repel(data = fig2_labels_post,
+                  aes(x = as.numeric(period_label) + x_nudge, label = label),
+                  size = 3, fontface = "bold", family = "poppins",
+                  direction = "y", nudge_x = 0.3,
+                  hjust = 0, segment.size = 0.2, segment.color = "grey70",
+                  min.segment.length = 0.2, box.padding = 0.3,
+                  seed = 42, show.legend = FALSE) +
+  facet_wrap(~ tier, ncol = 2) +
+  scale_color_manual(values = agent_colors, guide = "none") +
+  scale_x_continuous(limits = c(0.5, 2.5), breaks = c(1,2), labels = c(str_wrap("Canadian journalism plausibly in training data", 20), str_wrap("Post-training period", 15))) +
+  scale_y_continuous(
+    limits = c(-5, 80),
+    breaks = seq(0, 80, 20),
+    labels = label_percent(scale = 1)
+  ) +
+  labs(
+    x = NULL, y = "% of stories accurately recounted"
+  ) +
+  theme_brief +
+  theme(
+    strip.text = element_text(size = 10, face = "bold", family = "poppins",
+                              hjust = 0.5, color = "#272B26"),
+    axis.title.y = element_text(margin = margin(r = 8)),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.spacing = unit(1.5, "lines"),
+    plot.margin = margin(5, 30, 10, 15)
+  )
+
+# Agent legend bar (logos + text names, centered across full width)
+agent_legend_df <- tibble(
+  x = c(1, 2.5, 4, 5.5),
+  agent = agent_levels,
+  image = agent_logos[agent_levels],
+  color = agent_colors[agent_levels]
+)
+agent_legend <- ggplot(agent_legend_df) +
+  geom_image(aes(x = x, y = 0, image = image), size = 0.18, asp = 5) +
+  geom_text(aes(x = x + 0.2, y = 0, label = agent, color = agent),
+            hjust = 0, size = 2.8, family = "poppins", fontface = "bold",
+            show.legend = FALSE) +
+  scale_color_manual(values = agent_colors) +
+  scale_x_continuous(limits = c(0.3, 6.5)) +
+  theme_void() +
+  theme(plot.margin = margin(0, 0, 0, 0))
+
+p2_final <- plot_grid(agent_legend, NULL, p2, ncol = 1, rel_heights = c(0.06, 0.03, 1))
+p2_final
+save_plot(p2_final, "fig2_knowledge_accuracy", data = fig2_data, width = 7.1, height = 4.5)
+```
+
+![Figure `r fig_num("knowledge")`: Accuracy of AI model responses to Canadian news stories, by training data cutoff. Economy and flagship models queried without web search. N = `r format(nrow(t1) + nrow(t1_flag) + nrow(t1_fr) + nrow(t1_fr_flag), big.mark = ",")` responses across `r format(n_distinct(t1$story_id) + n_distinct(t1_fr$story_id), big.mark = ",")` stories (English and French).](analysis/figures/fig2_knowledge_accuracy.png){.figure}
+
+Figure `r fig_ref("knowledge")` shows the results. Note that our corpus draws exclusively from national outlets; local and regional coverage was not tested. The pattern is consistent across model tiers. Models showed at least partial knowledge of pre-cutoff Canadian news events in `r round(avg_knows_cheap)`% of economy-tier responses and `r round(avg_knows_flagship)`% of flagship-tier responses, then dropped sharply for post-cutoff stories (`r round(avg_post_cheap)`% and `r round(avg_post_flagship)`% accurate respectively). Among knowledgeable responses, economy models were accurate `r round(avg_pre_cheap)`% of the time on average; flagship models `r round(avg_pre_flagship)`%. Flagship models score higher overall (unsurprisingly, given they typically have larger training datasets) but the decline after the training cutoff appears across all models and tiers. This points to training data as the source of the knowledge rather than general reasoning, and suggests that more capable models have absorbed more Canadian news content, not less. The specific sources (Canadian journalism, wire services, Wikipedia, or other publicly available text covering the same events) cannot be isolated from model behavior alone.^[Economy-tier knowledge rates vary substantially by model: ChatGPT (`r round(economy_knows["ChatGPT"])`%), Gemini (`r round(economy_knows["Gemini"])`%), and Grok (`r round(economy_knows["Grok"])`%) all demonstrated knowledge in the large majority of pre-cutoff responses, while Claude demonstrated knowledge in only `r round(claude_knows_econ)`% — not because it lacked training data, but because it defaults to refusing rather than guessing when uncertain. As a result, Claude's low rate pulls down the economy-tier average, causing it to understate the knowledge the other three models actually demonstrate. Two-sample t-tests comparing per-response accuracy between economy and flagship models: pre-training stories t = `r tt_pre_t`, p `r tt_pre_p`; post-training stories t = `r tt_post_t`, p `r tt_post_p`. Flagship models were `r abs(tt_pre_diff)` percentage points `r if_else(tt_pre_diff > 0, "more", "less")` accurate on pre-training stories and `r abs(tt_post_diff)` percentage points `r if_else(tt_post_diff > 0, "more", "less")` accurate on post-training stories. Note that each model has a different training data cutoff date, so the pre- and post-cutoff story pools differ in size and date range across models and tiers; the averages reported here are means of per-model percentages.] ChatGPT and Grok show higher post-cutoff accuracy than Claude or Gemini, but this reflects hallucination — generating confident-sounding but fabricated information — not knowledge. Inspection of the responses reveals that these models confidently generate plausible-sounding but fabricated accounts of events they cannot have seen in training data: inventing specific but wrong outcomes (e.g., stating the Bank of Canada *held* rates when it actually *cut* them), producing generic descriptions vague enough to be unfalsifiable, or fabricating events wholesale. Claude, by contrast, typically acknowledges ignorance, resulting in lower measured "accuracy" but more honest responses.^[For post-cutoff stories, `r hall("ChatGPT","econ","pct_claims")`% of ChatGPT's economy-tier responses addressed the topic substantively enough to be coded as showing at least partial knowledge — despite the model never having seen the stories in training. Of those, `r hall("ChatGPT","econ","pct_wrong")`% were coded as inaccurate: the model generated confident, detailed responses about the right topic but fabricated the specifics (e.g., when asked about Calgary's June 2024 water crisis caused by a catastrophic water main break, it invented a scenario involving flash flooding and overwhelmed storm infrastructure). Grok's economy responses were similar: `r hall("Grok","econ","pct_claims")`% addressed post-cutoff stories substantively, with `r hall("Grok","econ","pct_wrong")`% of those coded inaccurate. Claude generated substantive responses for only `r hall("Claude","econ","pct_claims")`% of post-cutoff stories, declining to answer the rest. Flagship models are substantially less prone to this behaviour: ChatGPT's flagship responses were coded as showing knowledge of only `r hall("ChatGPT","flag","pct_claims")`% of post-cutoff stories (vs. `r hall("ChatGPT","econ","pct_claims")`% economy) and Grok's flagship `r hall("Grok","flag","pct_claims")`% (vs. `r hall("Grok","econ","pct_claims")`%), suggesting that hallucination is concentrated in cheaper, smaller models. This means the post-cutoff "accuracy" figures in Figure `r fig_ref("knowledge")` likely overstate true knowledge for economy-tier ChatGPT and Grok, which hallucinate more freely, and understate the relative honesty of models like Claude that refuse to guess.]
+
+Despite showing substantial knowledge of Canadian current events, models rarely attributed it. Models showed at least partial knowledge in `r round(pct_knowing_training)`% of responses to pre-cutoff stories. Among those responses, `r round(pct_no_cite_knowing)`% provided no source attribution of any kind — no named outlet, no recommendation to check a specific news organization, no general reference to "Canadian media." The training cutoff dates used here are self-reported by each company and may be approximate; some information could also reach models through reinforcement learning from human feedback (RLHF) — a process where human evaluators help fine-tune model behavior after initial training — system prompt updates, or other post-training processes. The sharp accuracy drop visible in Figure `r fig_ref("knowledge")` at each model's reported cutoff is consistent with these dates being broadly accurate.
+
+\vspace{1em}
+
+## 2) Do AI models produce journalism's value without its costs? {.question}
+
+AI models have absorbed Canadian journalism at scale and almost never attribute it, even for stories within their training window. We tested directly what happens when models can actively search the web. We enabled web search and asked models about `r n_articles` real articles from February 2026. Figure `r fig_ref("reproduction")` shows the default consumer experience: what happens when someone asks a generic topic question without requesting citations. This is how most people use AI models: "Tell me about X," not "What did the Toronto Star report about X?"
+
+With web search enabled, models retrieve content from across the web, including Canadian news sites, and synthesize it into responses. The blue squares show how often the result covers enough of the article's distinctive reporting (specific events, named individuals, key findings) that a reader could plausibly get the gist of the story without visiting the news site. These are not complete reproductions: they are partial summaries and paraphrases that cover some of the original article's distinctive content, though they sometimes contain factual errors or omissions (see "A note on accuracy" below). We evaluated each response against the source article to determine whether it covered the article's distinctive reporting, not merely the general topic.^[The "covers distinctive reporting" measure combines three LLM-coded levels: partial coverage (`r pct_partial`% of all generic-unprompted responses), close paraphrase (`r pct_close`%), and verbatim reproduction (`r pct_verbatim`%). Partial coverage — where the response covers article-specific events and findings in paraphrased form rather than reproducing exact facts or language — accounts for the majority of viable substitutes. Rule-based pattern-matching alone captures only a fraction of this semantic coverage, which is why LLM-based assessment was necessary. Even partial coverage of a story's distinctive reporting can reduce the consumer's need to visit the source, but readers should note that the blue category reflects "covers some of the article-specific reporting," not full reproduction.] The green squares show how often the model credits the source by naming the outlet in the response text or via structured machine-readable citations returned alongside the response.
+
+Coverage rates are high while attribution rates are not. Gemini and Claude covered distinctive reporting in `r round(pw_generic_repro["Gemini"])`% and `r round(pw_generic_repro["Claude"])`% of responses respectively, but Gemini credited the source only `r round(pw_generic_names["Gemini"])`% of the time. Grok covered distinctive reporting in `r round(pw_generic_repro["Grok"])`% of responses while citing the source in only `r round(pw_generic_names["Grok"])`% of them. ChatGPT, one of the most widely used models, covered distinctive content in `r round(pw_generic_repro["ChatGPT"])`% of responses but almost never credited the originating newsroom. Even when models fail to cover the distinctive reporting, they still deliver a topical response that can reduce the consumer's motivation to visit the source. AI models use web search to retrieve current journalism and deliver it directly to consumers, rarely crediting the newsroom that produced it.^[A pilot sample of `r n_t2_flagship_pilot` flagship-tier responses showed no significant differences on any tested outcome (all p > 0.05; see Methodology). This is expected: substitution and attribution behaviour are driven by each provider's search and citation architecture.]
+
+![Figure `r fig_num("reproduction")`: Coverage of distinctive reporting and source attribution for recent Canadian news articles. Economy models with web search enabled under generic framing with no citation prompt. N = `r n_generic_unprompted` responses across `r n_distinct(t2_url$article_id)` articles.](analysis/figures/fig3_reproduction_vs_attribution.png){.figure}
+
+
+```{r fig3-waffle, fig.width=7.1, fig.height=3.6, cache=TRUE, dependson="load-data"}
+# ── Compute per-agent stats (generic, unprompted) ──
+fig3_stats <- t2_url |>
+  filter(framing_label == "Generic", citation_label == "Unprompted") |>
+  mutate(
+    reproduces = llm_reproduction %in% c("partial", "close_paraphrase", "verbatim")
+  ) |>
+  group_by(agent_clean) |>
+  summarise(
+    n = n(),
+    pct_reproduces = round(mean(reproduces) * 100),
+    pct_cites = round(mean(cited) * 100),
+    .groups = "drop"
+  )
+
+# ── Build waffle grid (10x10 per agent) ──
+build_waffle <- function(agent_name, pct_reproduces, pct_cites) {
+  cats <- c(
+    rep("Credits the source", pct_cites),
+    rep("Covers, no credit", pct_reproduces - pct_cites),
+    rep("Generic topic response", 100 - pct_reproduces)
+  )
+  tibble(
+    agent_clean = agent_name,
+    cell = 1:100,
+    col = ((cell - 1) %% 10) + 1,
+    row = ((cell - 1) %/% 10) + 1,
+    category = factor(cats, levels = c(
+      "Credits the source", "Covers, no credit", "Generic topic response"
+    ))
+  )
+}
+
+waffle_data <- pmap_dfr(fig3_stats, function(agent_clean, n, pct_reproduces, pct_cites) {
+  build_waffle(as.character(agent_clean), pct_reproduces, pct_cites)
+}) |>
+  mutate(agent_clean = factor(agent_clean, levels = agent_levels))
+
+waffle_colors <- c(
+  "Credits the source"    = "#467742",
+  "Covers, no credit"     = "#6BADC6",
+  "Generic topic response" = "#E8E6E3"
+)
+
+# ── Summary labels ──
+fig3_labels <- fig3_stats |>
+  mutate(
+    covers_label = paste0(pct_reproduces, "% cover content"),
+    credit_label = paste0(pct_cites, "% credit source")
+  )
+
+# ── Per-agent alpha ──
+agent_alpha <- c("ChatGPT" = 0.85, "Claude" = 0.95, "Gemini" = 1.0, "Grok" = 0.90)
+
+make_waffle_panel <- function(agent_name) {
+  d <- waffle_data |> filter(agent_clean == agent_name)
+  sl <- fig3_labels |> filter(agent_clean == agent_name)
+  ld <- tibble(image = agent_logos[agent_name], x = 3.5, y = 13.2)
+  a <- agent_alpha[agent_name]
+
+  p <- ggplot(d, aes(x = col, y = row, fill = category)) +
+    geom_tile(color = "white", linewidth = 1, width = 0.92, height = 0.92, alpha = a) +
+    geom_image(data = ld, aes(x = x, y = y, image = image),
+               inherit.aes = FALSE, size = 0.12, asp = 1.3) +
+    annotate("text", x = 6.2, y = 13.2, label = agent_name,
+             size = 2.8, family = "poppins", fontface = "bold",
+             color = agent_colors[agent_name], hjust = 0) +
+    annotate("text", x = 5.5, y = -0.5, label = sl$covers_label,
+             size = 2.4, family = "poppins", fontface = "bold", color = "#6BADC6") +
+    annotate("text", x = 5.5, y = -1.5, label = sl$credit_label,
+             size = 2.4, family = "poppins", fontface = "bold", color = "#467742") +
+    scale_fill_manual(values = waffle_colors) +
+    scale_x_continuous(limits = c(0, 11.2), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(-1.8, 14.2), expand = c(0, 0)) +
+    coord_equal(clip = "off") +
+    theme_void() +
+    theme(plot.margin = margin(0, 2, 0, 2))
+
+  p <- p + guides(fill = "none")
+  p
+}
+
+panels <- map(agent_levels, make_waffle_panel)
+
+# ── Shared legend (built as a standalone ggplot) ──
+legend_df <- tibble(
+  x     = c(1, 3.2, 5.6),
+  label = c("Credits the source", "Covers, no credit", "Generic topic response"),
+  color = c("#467742", "#6BADC6", "#E8E6E3")
+)
+shared_legend <- ggplot(legend_df) +
+  geom_point(aes(x = x, y = 0), shape = 15, size = 4, color = legend_df$color) +
+  geom_text(aes(x = x + 0.15, y = 0, label = label), hjust = 0,
+            size = 2.8, family = "poppins", colour = "#272B26") +
+  scale_x_continuous(limits = c(0.5, 8.5)) +
+  theme_void() +
+  theme(plot.margin = margin(-30, 0, 0, 0))
+
+grid2 <- plot_grid(plotlist = panels, nrow = 1, align = "h")
+
+p3 <- plot_grid(grid2, shared_legend, ncol = 1, rel_heights = c(1, 0.05))
+p3
+save_plot(p3, "fig3_reproduction_vs_attribution", data = waffle_data, width = 7.1, height = 3.6)
+```
+
+This substitution extends to paywalled content. We tested whether paywalls provide any protection across seven outlets spanning the spectrum: free (CBC News, Radio-Canada, Canadian Press), general paywalled (Toronto Star, Montreal Gazette, National Post), and niche paywalled (The Logic). Averaged across all paywalled outlets, models covered distinctive reporting from originally paywalled content (`r round(pw_paid_repro_pct)`%) at rates comparable to free outlets (`r round(pw_free_repro_pct)`%). The competitive news market ensures the same information appears elsewhere — stories are syndicated through wire services, reposted on aggregators, and shared across social media. Paywalls hold only when an outlet's journalism is distinctive enough that no free or more easily accessible substitute exists; competitive coverage renders most paywalls irrelevant.
+
+For most stories, paywalls are bypassed rather than breached: the competitive news market ensures the same information appears across multiple outlets, syndicated through wire services, reposted on aggregators, and shared on social media. However, API citation logs from some models showed direct citations to paywalled URLs, including hard-paywalled niche outlets, with extensive verbatim reproduction of the source text. This suggests that some models' web retrieval tools may access paywalled content that would be blocked for human readers. Whether the mechanism is direct access or competitive syndication, the result is the same: paywalled journalism is reproduced without compensation.
+
+**A note on accuracy.** Track 1 shows a clear pattern of hallucination for post-cutoff stories: models generate plausible-sounding narratives that match the general topic but get key facts wrong. When asked about the Bank of Canada's June 2024 rate cut, ChatGPT's economy model confidently reported that the Bank *held* rates steady — the opposite of what happened. These responses are not retrieving stored knowledge; they are pattern-matching against generic templates (a funeral draws "thousands of mourners," a cabinet shuffle follows "scandals and controversies") and inventing specifics. Track 2 presents a more ambiguous picture. Among responses that covered distinctive reporting from the source article, `r round(t2_repro_pct_inaccurate)`% were coded as diverging from the original article's reporting. This measure captures divergence from one specific article, not factual error — a response that accurately synthesizes several other sources covering the same story would also be flagged here. The substitution and attribution findings do not depend on this measure.
+
+\vspace{1em}
+
+## 3) Do consumers get sent back to the source? {.question}
+
+The third stage of the value chain is distribution: when AI models answer consumer questions, do those consumers have any pathway back to the journalism that informed the response? For publishers, this is the key question: do models credit and link to original source material?
+
+Under realistic conditions (a generic topic question with no special request for citations), most models link to Canadian news sites at moderate-to-high rates but almost never name the originating outlet. Gemini (`r round(pw_generic_urls["Gemini"])`%), Claude (`r round(pw_generic_urls["Claude"])`%), and Grok (`r round(pw_generic_urls["Grok"])`%) all provided Canadian news URLs in many cases, while ChatGPT did so less frequently (`r round(pw_generic_urls["ChatGPT"])`%). But the more visible form of attribution (naming the outlet) was rare across all models, ranging from `r round(min(pw_generic_names))`% to `r round(max(pw_generic_names))`% — a pattern consistent with independent audits of AI search citation practices.^6^ Models often include a link to Canadian journalism, but without naming the source in the response text, consumers who do not click through every URL will not know whose reporting informed the answer. Beyond Canadian news URLs, all models link at high rates to non-Canadian sources such as Wikipedia, Reuters, AP, or U.S. news outlets, none of which generate traffic for the Canadian newsrooms whose journalism created the content.
+
+```{r fig4-attribution-pathway, fig.width=7.1, fig.height=5.5, cache=TRUE, dependson="load-data"}
+fig4_path <- t2_url |>
+  mutate(
+    names_outlet = source_cited != "none",
+    has_cdn_url_bool = has_cdn_url
+  ) |>
+  group_by(agent_clean, framing_label, citation_label) |>
+  summarise(
+    n = n(),
+    pct_names = mean(names_outlet) * 100,
+    pct_cdn_url = mean(has_cdn_url_bool) * 100,
+    .groups = "drop"
+  ) |>
+  mutate(logo = agent_logos[as.character(agent_clean)])
+
+make_panel <- function(data) {
+  ggplot(data, aes(x = pct_names, y = pct_cdn_url)) +
+    annotate("rect", xmin = 50, xmax = 108, ymin = 50, ymax = 108,
+             fill = "#467742", alpha = 0.08) +
+    annotate("rect", xmin = -8, xmax = 50, ymin = -8, ymax = 50,
+             fill = "#FF8200", alpha = 0.08) +
+    geom_vline(xintercept = 50, colour = "grey80", linewidth = 0.3) +
+    geom_hline(yintercept = 50, colour = "grey80", linewidth = 0.3) +
+    geom_image(aes(image = logo), size = 0.12, asp = 1) +
+    scale_x_continuous(name = NULL, limits = c(-8, 108), breaks = c(0, 50, 100),
+                       labels = function(x) paste0(x, "%")) +
+    scale_y_continuous(name = NULL, limits = c(-8, 108), breaks = c(0, 50, 100),
+                       labels = function(x) paste0(x, "%")) +
+    coord_fixed() +
+    theme_brief +
+    theme(
+      legend.position = "none",
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.text = element_text(size = 6, colour = "grey60", family = "poppins"),
+      axis.ticks = element_line(colour = "grey80", linewidth = 0.3),
+      plot.margin = margin(2, 2, 2, 2)
+    )
+}
+
+conditions <- expand.grid(
+  citation_label = c("Unprompted", "Cite sources"),
+  framing_label = c("Generic", "Specific", "Direct"),
+  stringsAsFactors = FALSE
+)
+
+panels <- pmap(conditions, function(citation_label, framing_label) {
+  d <- fig4_path |> filter(citation_label == !!citation_label, framing_label == !!framing_label)
+  make_panel(d)
+})
+
+make_col_header <- function(title, desc) {
+  ggdraw() +
+    draw_label(title, fontfamily = "poppins", fontface = "bold", size = 9,
+               colour = "#272B26", y = 0.65) +
+    draw_label(desc, fontfamily = "poppins", size = 7,
+               colour = "grey50", y = 0.2)
+}
+
+col_headers <- plot_grid(
+  make_col_header("Generic", "\"Tell me about this topic\""),
+  make_col_header("Specific", "\"What did [outlet] report?\""),
+  make_col_header("Direct", "\"Summarize this EXACT article\""),
+  ncol = 3
+)
+
+row1_label <- ggdraw() + draw_label("No ask for\ncited sources", fontfamily = "poppins", fontface = "bold",
+                                      size = 8, colour = "#272B26", angle = 90)
+row2_label <- ggdraw() + draw_label("Ask for\ncited sources", fontfamily = "poppins", fontface = "bold",
+                                      size = 8, colour = "#272B26", angle = 90)
+
+row1_panels <- plot_grid(panels[[1]], panels[[3]], panels[[5]], ncol = 3, align = "hv")
+row2_panels <- plot_grid(panels[[2]], panels[[4]], panels[[6]], ncol = 3, align = "hv")
+
+row1 <- plot_grid(row1_label, row1_panels, ncol = 2, rel_widths = c(0.06, 1))
+row2 <- plot_grid(row2_label, row2_panels, ncol = 2, rel_widths = c(0.06, 1))
+
+grid_body <- plot_grid(
+  plot_grid(NULL, col_headers, ncol = 2, rel_widths = c(0.06, 1)),
+  row1, row2,
+  ncol = 1, rel_heights = c(0.12, 1, 1)
+)
+
+# Agent legend bar (logos + text names, centered across full width)
+fig4_legend_df <- tibble(
+  x = c(1, 2.5, 4, 5.5),
+  agent = agent_levels,
+  image = agent_logos[agent_levels],
+  color = agent_colors[agent_levels]
+)
+fig4_legend <- ggplot(fig4_legend_df) +
+  geom_image(aes(x = x, y = 0, image = image), size = 0.18, asp = 5) +
+  geom_text(aes(x = x + 0.2, y = 0, label = agent, color = agent),
+            hjust = 0, size = 2.8, family = "poppins", fontface = "bold",
+            show.legend = FALSE) +
+  scale_color_manual(values = agent_colors) +
+  scale_x_continuous(limits = c(0.3, 6.5)) +
+  theme_void() +
+  theme(plot.margin = margin(0, 0, 0, 0))
+
+x_label <- ggdraw() + draw_label("Model names a Canadian news outlet", fontfamily = "poppins", size = 10, colour = "#272B26")
+y_label <- ggdraw() + draw_label("Model links to a Canadian news outlet", fontfamily = "poppins", size = 10, colour = "#272B26", angle = 90)
+
+inner <- plot_grid(y_label, grid_body, ncol = 2, rel_widths = c(0.04, 1))
+
+p4b <- plot_grid(
+  fig4_legend, NULL, inner, x_label,
+  ncol = 1, rel_heights = c(0.055, 0.025, 1, 0.06)
+)
+
+p4b
+save_plot(p4b, "fig4_attribution_pathway", data = fig4_path, width = 7.1, height = 5.8)
+```
+
+Figure `r fig_ref("attribution")` tests whether AI models can be pushed toward better attribution. We varied both the framing of the question and whether consumers explicitly asked models to cite sources. The columns show three framing conditions: 1) generic topic questions (as in Figure `r fig_ref("reproduction")`); 2) questions referencing specific facts from the article; and 3) questions that directly name the outlet. The rows show whether the prompt requested citations. Each panel plots the four models on two dimensions: the probability of naming the outlet (x-axis) and the probability of linking to a Canadian news site (y-axis). The upper-right quadrant (green shading) is where models both name and link — the closest equivalent to social media posts sharing news content with clear attribution and a click-through URL. The lower-left (orange shading) is the worst case: models neither name the outlet nor link to a Canadian news site, leaving consumers with no path back to the source and news organizations with no way to recapture value from their work.
+
+Under the most favourable conditions (directly naming the outlet and explicitly asking for citations), attribution improves substantially across all models. All four named the outlet in a majority of responses: Claude (`r round(pw_direct_names["Claude"])`%), Gemini (`r round(pw_direct_names["Gemini"])`%), ChatGPT (`r round(pw_direct_names["ChatGPT"])`%), and Grok (`r round(pw_direct_names["Grok"])`%). Linking rates were also strong: Grok (`r round(pw_direct_urls["Grok"])`%), Gemini (`r round(pw_direct_urls["Gemini"])`%), Claude (`r round(pw_direct_urls["Claude"])`%), and ChatGPT (`r round(pw_direct_urls["ChatGPT"])`%). Meaningful attribution is technically achievable. The gap between the default experience and the best-case scenario is a core finding: most consumers will never explicitly name an outlet or ask for citations, so the generic-condition results reflect the experience that shapes the market for journalism.
+
+```{r fig5-data-prep, cache=TRUE, dependson="load-data", include=FALSE}
+cdn_free_list <- c("CBC News", "CBC", "CBC Sports", "CBC/Radio-Canada",
+                   "CTV News", "CTV", "CTV Calgary", "CTV Montreal",
+                   "Global News", "Global Calgary",
+                   "City News", "CityNews", "CP24",
+                   "Radio-Canada", "Radio Canada International",
+                   "La Presse", "Sportsnet", "TSN", "RDS",
+                   "TVA Nouvelles", "TVA", "Noovo Info", "LCN", "RDI",
+                   "The Canadian Press")
+
+cdn_paywalled_list <- c("The Globe and Mail", "Globe and Mail",
+                        "National Post", "Toronto Star", "Financial Post",
+                        "BNN Bloomberg", "Montreal Gazette",
+                        "Edmonton Journal", "Calgary Herald", "Ottawa Citizen",
+                        "Vancouver Sun", "Halifax Examiner",
+                        "Le Devoir", "Maclean's", "Macleans",
+                        "Journal de Montréal", "Journal de Montreal",
+                        "Le Journal de Montréal", "Le Droit", "Le Nouvelliste",
+                        "Le Quotidien", "Journal de Quebec", "Le Journal de Québec",
+                        "Winnipeg Free Press", "The Logic",
+                        "iPolitics", "The Narwhal", "The Tyee",
+                        "Canadaland", "Hill Times", "Rebel News")
+
+intl_news_list <- c("Reuters", "Associated Press", "AP News",
+                    "BBC", "BBC News", "The New York Times", "Bloomberg",
+                    "The Washington Post", "CNN", "Fox News",
+                    "Al Jazeera", "The Guardian", "CNBC", "ABC News",
+                    "NBC News", "NPR", "PBS", "The Wall Street Journal",
+                    "Sky News", "France 24", "DW",
+                    "The Economist", "Foreign Affairs", "Politico",
+                    "The Atlantic", "Axios", "The Hill",
+                    "ESPN", "MLB.com", "FIFA", "NHL.com")
+
+classify_source <- function(s) {
+  case_when(
+    s %in% cdn_free_list ~ "Canadian news (free)",
+    s %in% cdn_paywalled_list ~ "Canadian news (paywalled)",
+    s %in% intl_news_list ~ "International news",
+    TRUE ~ "Other"
+  )
+}
+
+normalize_outlet <- function(source) {
+  case_when(
+    source %in% c("CTV", "CTV News", "CTV Calgary", "CTV Montreal") ~ "CTV News",
+    source %in% c("CBC", "CBC News", "CBC Sports", "CBC/Radio-Canada") ~ "CBC News",
+    source %in% c("Globe and Mail", "The Globe and Mail") ~ "The Globe and Mail",
+    source %in% c("Toronto Star", "The Toronto Star") ~ "Toronto Star",
+    source %in% c("Montreal Gazette", "The Montreal Gazette") ~ "Montreal Gazette",
+    source %in% c("Global News", "Global Calgary") ~ "Global News",
+    source %in% c("Radio Canada International", "Radio-Canada") ~ "Radio-Canada",
+    source %in% c("Maclean's", "Macleans") ~ "Maclean's",
+    source %in% c("City News", "CityNews") ~ "City News",
+    source %in% c("Associated Press", "AP News") ~ "AP",
+    source %in% c("BBC", "BBC News") ~ "BBC",
+    source %in% c("TVA", "TVA Nouvelles") ~ "TVA Nouvelles",
+    source %in% c("Journal de Montréal", "Journal de Montreal", "Le Journal de Montréal") ~ "Journal de Montréal",
+    TRUE ~ source
+  )
+}
+
+fig5_combined <- bind_rows(
+  t1      |> mutate(tier = "economy"),
+  t1_flag |> mutate(tier = "flagship"),
+  t1_fr      |> mutate(tier = "economy"),
+  t1_fr_flag |> mutate(tier = "flagship")
+)
+
+fig5_all <- fig5_combined |>
+  filter(map_lgl(sources_cited, ~ length(.x) > 0)) |>
+  unnest(sources_cited) |>
+  rename(source = sources_cited) |>
+  mutate(category = classify_source(source))
+
+fig5_other_n      <- fig5_all |> filter(category == "Other") |> nrow()
+fig5_other_unique <- fig5_all |> filter(category == "Other") |> distinct(source) |> nrow()
+
+citation_counts_by_type <- fig5_all |>
+  filter(category != "Other") |>
+  filter(citation_type %in% c("named_as_source", "recommended")) |>
+  mutate(
+    outlet = normalize_outlet(source),
+    mention_type = factor(citation_type,
+                          levels = c("named_as_source", "recommended"),
+                          labels = c("Used as a source", "Recommended to check for more information"))
+  ) |>
+  count(outlet, mention_type, name = "citations")
+
+citation_counts <- fig5_all |>
+  filter(category != "Other") |>
+  mutate(outlet = normalize_outlet(source)) |>
+  count(outlet, sort = TRUE, name = "citations")
+
+readership <- read_csv("data/outlet_readership.csv", show_col_types = FALSE) |>
+  select(outlet, monthly_visits, category)
+
+fig5_data <- readership |>
+  left_join(citation_counts, by = "outlet") |>
+  mutate(citations = replace_na(citations, 0)) |>
+  filter(citations > 0)
+
+fig5_data_facet <- readership |>
+  cross_join(tibble(mention_type = factor(c("Used as a source", "Recommended to check for more information"),
+                                          levels = c("Used as a source", "Recommended to check for more information")))) |>
+  left_join(citation_counts_by_type, by = c("outlet", "mention_type")) |>
+  mutate(
+    citations = replace_na(citations, 0),
+    category = factor(category, levels = c("Canadian news (free)",
+                                            "Canadian news (paywalled)",
+                                            "International news"))
+  ) |>
+  filter(citations > 0)
+
+fig5_n_named <- citation_counts_by_type |> filter(mention_type == "Used as a source") |> pull(citations) |> sum()
+fig5_n_rec   <- citation_counts_by_type |> filter(mention_type == "Recommended to check for more information") |> pull(citations) |> sum()
+fig5_n_total <- fig5_n_named + fig5_n_rec
+
+named_counts <- citation_counts_by_type |>
+  filter(mention_type == "Used as a source") |>
+  select(outlet, citations) |>
+  deframe()
+
+get_named <- function(outlet) as.integer(replace_na(named_counts[outlet], 0))
+
+rec_counts <- citation_counts_by_type |>
+  filter(mention_type == "Recommended to check for more information") |>
+  select(outlet, citations) |>
+  deframe()
+
+get_rec <- function(outlet) as.integer(replace_na(rec_counts[outlet], 0))
+
+named_by_agent <- fig5_all |>
+  filter(citation_type == "named_as_source", category != "Other") |>
+  mutate(agent_clean = recode(provider, !!!provider_to_agent)) |>
+  count(agent_clean, name = "n") |>
+  mutate(pct = round(n / sum(n) * 100))
+
+fig5_grok_named_pct <- named_by_agent |> filter(agent_clean == "Grok") |> pull(pct)
+
+rec_by_agent <- fig5_all |>
+  filter(citation_type == "recommended", category != "Other") |>
+  mutate(agent_clean = recode(provider, !!!provider_to_agent)) |>
+  count(agent_clean, name = "n") |>
+  mutate(pct = round(n / sum(n) * 100))
+
+fig5_claude_rec_pct <- rec_by_agent |> filter(agent_clean == "Claude") |> pull(pct)
+
+# Per-response rates in economy tier (EN + FR pooled) for footnote
+econ_pooled <- bind_rows(t1, t1_fr)
+
+fn_econ_rate <- function(prov, type) {
+  n_match <- sum(econ_pooled$provider == prov & econ_pooled$citation_type == type)
+  n_total <- sum(econ_pooled$provider == prov)
+  round(100 * n_match / n_total)
+}
+
+fig5_grok_named_resp_pct   <- fn_econ_rate("xai",       "named_as_source")
+fig5_claude_rec_resp_pct   <- fn_econ_rate("anthropic",  "recommended")
+fig5_gemini_none_resp_pct  <- fn_econ_rate("gemini",     "none")
+fig5_openai_rec_resp_pct   <- fn_econ_rate("openai",     "recommended")
+
+# ChatGPT: pct of its outlet mentions that are recommendations vs named_as_source
+openai_unnested <- fig5_all |> filter(provider == "openai", category != "Other")
+fig5_openai_rec_share <- round(100 * sum(openai_unnested$citation_type == "recommended") / nrow(openai_unnested))
+
+fig5_jdm_total <- citation_counts |> filter(outlet == "Journal de Montréal") |> pull(citations)
+fig5_jdm_total <- if (length(fig5_jdm_total) == 0) 0L else as.integer(fig5_jdm_total)
+```
+
+The distribution consequences extend beyond individual articles. Outlet mentions across all `r format(nrow(t1) + nrow(t1_flag) + nrow(t1_fr) + nrow(t1_fr_flag), big.mark = ",")` Track 1 responses fall into two categories: outlets named as the source of a specific claim, and outlets recommended when a model cannot answer. Both patterns reveal the same concentration dynamic, but they reflect different model behaviours.
+
+Among outlets used as genuine sources, CBC News leads with `r get_named("CBC News")` attributions, followed by The Globe and Mail (`r get_named("The Globe and Mail")`), Radio-Canada (`r get_named("Radio-Canada")`), La Presse (`r get_named("La Presse")`), and Global News (`r get_named("Global News")`) — driven almost entirely by Grok, which accounts for `r fig5_grok_named_pct`% of all named-as-source mentions. CTV News, despite its size, received only `r get_named("CTV News")` named-as-source mentions. The Toronto Star received `r get_named("Toronto Star")`; the Montreal Gazette, `r get_named("Montreal Gazette")`.
+
+The recommended category is far larger, with `r format(fig5_n_rec, big.mark = ",")` mentions total, but reflects a different phenomenon: models pointing users elsewhere when they lack knowledge. CBC News (`r format(get_rec("CBC News"), big.mark = ",")`), The Globe and Mail (`r format(get_rec("The Globe and Mail"), big.mark = ",")`), and CTV News (`r format(get_rec("CTV News"), big.mark = ",")`) dominate here, driven overwhelmingly by Claude, which accounts for `r fig5_claude_rec_pct`% of all recommended mentions. These are deflections, however, and cluster around the same small set of nationally prominent free outlets. The Toronto Star received `r format(get_rec("Toronto Star"), big.mark = ",")` recommended mentions; Financial Post, `r get_rec("Financial Post")`; Montreal Gazette, `r get_rec("Montreal Gazette")`.
+
+![Figure `r fig_ref("attribution")`: Source naming and linking rates by framing condition and citation prompt. Economy models with web search enabled. N = `r format(sum(fig4_path$n), big.mark = ",")` responses across `r n_distinct(t2_url$article_id)` articles.](analysis/figures/fig4_attribution_pathway.png){.figure}
+
+
+
+AI models surface the outlets consumers already know, while smaller and paywalled outlets that may produce significant original reporting are largely absent. Among English-language outlets, CBC, CTV, and Global News — all freely accessible — capture the most AI visibility in both categories. The Globe and Mail performs relatively well, but the Toronto Star and Financial Post are marginal despite being important newsrooms. Regional Postmedia papers serving Calgary, Edmonton, Ottawa, and Vancouver are essentially absent. Among French-language outlets, Radio-Canada and La Presse dominate, with Le Devoir a distant third. The Journal de Montréal, one of Quebec's most widely read papers, received only `r fig5_jdm_total` total mentions across all models. Figure `r fig_ref("concentration")` plots total AI mentions against monthly web visits for each outlet, combining outlets named as sources (n = `r format(fig5_n_named, big.mark = ",")`) and outlets recommended for further reading (n = `r format(fig5_n_rec, big.mark = ",")`). The diagonal reference line shows proportional representation where an outlet's AI mentions match its share of total readership. Canadian outlets tend to sit above this line: when answering questions about Canadian news, AI models cite Canadian sources more than their global audience share would predict, which is the expected pattern. 
+
+```{r fig5-citation-vs-readership, fig.width=7.1, fig.height=5, cache=TRUE, dependson="fig5-data-prep"}
+fig5_colors <- c(
+  "Canadian news (free)"      = "#69A849",
+  "Canadian news (paywalled)" = "#FF8200",
+  "International news"        = "#6BADC6"
+)
+
+fig5_label_outlets <- c(
+  "CBC News", "Radio-Canada", "CTV News", "Global News", "The Canadian Press",
+  "The Globe and Mail", "Toronto Star", "National Post",
+  "Reuters", "BBC", "The New York Times", "The Guardian", "CNN","Montreal Gazette"
+)
+
+# Reference line: citations ∝ readership (slope=1 on log-log, intercept anchored to data centroid)
+fig5_ref_slope     <- 1  # unit slope on log-log = proportional
+fig5_ref_intercept <- mean(log10(fig5_data$citations)) - fig5_ref_slope * mean(log10(fig5_data$monthly_visits))
+
+p5 <- ggplot(fig5_data, aes(x = monthly_visits, y = citations, fill = category)) +
+  annotate("text", x = 2e8, y = 10^(fig5_ref_intercept + fig5_ref_slope * log10(2e8)) * 1.6,
+           label = "Proportional", size = 2.4, colour = "grey50",
+           family = "poppins", fontface = "italic", hjust = 0) +
+  geom_point(size = 3, alpha = 0.85, color = "black", shape = 21) +
+  geom_text_repel(
+    data = fig5_data |> filter(outlet %in% fig5_label_outlets),
+    aes(label = outlet),
+    size = 2.8, fontface = "bold",
+    segment.color = "grey60", segment.alpha = 0.4, segment.size = 0.4,
+    box.padding = 0.5, point.padding = 0.3,
+    min.segment.length = 0.1,
+    seed = 42,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(
+    values = fig5_colors,
+    labels = c("Canadian news (free)" = "Canadian (free)",
+               "Canadian news (paywalled)" = "Canadian (paywalled)",
+               "International news" = "International"),
+    name = NULL
+  ) +
+  scale_x_log10(labels = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(labels = label_comma()) +
+  annotation_logticks(sides = "bl", size = 0.2, color = "grey70") +
+  labs(
+    x = "Monthly web visits (log scale)",
+    y = "Total AI mentions (log scale)"
+  ) +
+  guides(
+    color = guide_legend(override.aes = list(size = 4), nrow = 1)
+  ) +
+  theme_brief +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(size = 11),
+    legend.key.size = unit(0.5, "cm"),
+    legend.spacing.x = unit(0.4, "cm")
+  )
+
+p5
+save_plot(p5, "fig5_citation_vs_readership", data = fig5_data, width = 7.1, height = 5)
+
+# ── Economy vs flagship t-test: Canadian sources cited per response ──
+fig5_tier_test <- fig5_combined |>
+  mutate(n_cdn = map_int(sources_cited, ~ sum(.x %in% c(cdn_free_list, cdn_paywalled_list))))
+
+fig5_ttest    <- t.test(n_cdn ~ tier, data = fig5_tier_test)
+fig5_econ_mean <- mean(fig5_tier_test$n_cdn[fig5_tier_test$tier == "economy"])
+fig5_flag_mean <- mean(fig5_tier_test$n_cdn[fig5_tier_test$tier == "flagship"])
+```
+
+![Figure `r fig_num("concentration")`: Total AI mentions vs. monthly web visits by outlet. Mentions include outlets named as sources (n = `r format(fig5_n_named, big.mark = ",")`) and outlets recommended for further reading (n = `r format(fig5_n_rec, big.mark = ",")`). Economy and flagship models queried without web search. N = `r format(nrow(fig5_combined), big.mark = ",")` responses (English and French). Readership data from SimilarWeb (January 2026).](analysis/figures/fig5_citation_vs_readership.png){.figure}
+
+The distribution of citations was `r if (fig5_ttest$p.value < 0.05) "statistically different" else "not statistically different"` between economy and flagship model tiers (economy mean = `r round(fig5_econ_mean, 2)`, flagship mean = `r round(fig5_flag_mean, 2)` Canadian sources cited per response; *p* `r if (fig5_ttest$p.value < 0.001) "< 0.001" else paste0("= ", round(fig5_ttest$p.value, 3))`). AI models also cited `r fig5_other_unique` non-news sources a total of `r format(fig5_other_n, big.mark = ",")` times, focusing predominantly on Canadian government agencies (Statistics Canada, Global Affairs Canada, Bank of Canada), polling firms (Nanos, Angus Reid, Leger), and institutional sources. These are omitted from Figure `r fig_ref("concentration")` to focus on news outlets.^[Models differ substantially in citation style. In the economy tier (English and French combined), Grok named a source inline in `r fig5_grok_named_resp_pct`% of responses, the highest of any model, and accounts for `r fig5_grok_named_pct`% of all named-as-source outlet mentions across all tiers. Claude almost never names sources inline (under 1% of responses); instead it recommends outlets at the end of a response when it cannot answer, accounting for `r fig5_claude_rec_pct`% of all recommended mentions and typically listing the same short roster of nationally prominent free outlets (CBC, Globe and Mail, CTV). ChatGPT almost exclusively recommends rather than names sources (`r fig5_openai_rec_share`% of its outlet mentions are recommendations), but does so infrequently: only `r fig5_openai_rec_resp_pct`% of its economy-tier responses mention any outlet at all. Gemini rarely attributes sources regardless of knowledge level (`r fig5_gemini_none_resp_pct`% of economy responses cite nothing), answering from training data without acknowledging where information came from. These behavioural differences mean cross-model citation counts are not directly comparable.]
+
+Across all `r format(nrow(t1_pooled_training), big.mark = ",")` responses to pre-cutoff stories (English and French combined), `r round(pct_no_cite_pooled)`% cited no source whatsoever. The pattern holds across both language groups: `r round(pct_no_cite_fr_training)`% of responses to French-language stories provided no citation, compared to `r round(pct_no_cite_en_training)`% for English-language stories. The attribution gap is not a language-specific phenomenon.^[When French-language outlets were cited, they appeared in only `r round(pct_cites_fr_outlet_training)`% of responses to French stories. The disparity holds across all four models and both tiers.] French-language journalism is doubly disadvantaged: its content is absorbed into model training data, but the outlets that produced it are almost never acknowledged.
+
+
+# Conclusion {.conclusion}
+
+AI models possess extensive knowledge of Canadian current events consistent with having ingested Canadian news reporting (though the exact provenance cannot be isolated from model behavior alone, as noted above). They answer detailed questions about Canadian politics, economics, and society with a specificity most consistent with having trained on Canadian journalism. With web access, they go further, producing responses that cover enough of the original reporting that could reduce a consumer's need to visit the source (often with factual errors the consumer has no easy way to catch, because source names are rarely provided in the response text). The competitive structure of news coverage means most Canadian journalism is freely discoverable somewhere, and AI models capture that value while rarely identifying the source in the response itself.
+
+Under default API conditions (approximating unprompted consumer use), most models included links to Canadian news sites in a majority of responses. But they rarely named any Canadian source in the response text itself: a consumer who does not click through every link will not know whose journalism informed the answer. When consumers explicitly asked for citations, all models improved substantially. Naming sources is technically achievable today; the failure is one of default design, not capability.^8^ The result is a system in which AI companies extract the informational value of journalism — the facts, analysis, and context that journalists produce — while the newsrooms that created it receive links but not recognition in the text consumers actually read.
+
+The path forward requires no new technical capability: meaningful attribution is a choice. Canada has set precedent through the Online News Act: technology companies profiting from journalistic content must share value with producers. AI companies represent a more direct form of value extraction than social media platforms: they absorb journalism, transform it, and redistribute it without identifying its origin. But improved citation alone will not resolve the underlying tension. The current news model depends on human journalists interacting with democratic actors, and AI-mediated distribution severs the economic link between the production and consumption of journalism. Regulatory frameworks may need to go beyond attribution to address the value transfer from Canadian journalism to AI companies.^7^
+
+
+# Methodology {.methodology}
+
+This study uses two complementary empirical tracks. Track 1 (Content Audit) tests whether AI models have absorbed Canadian journalism into their training data and whether they attribute it. We prompted four major AI models on 2,267 real Canadian news stories with web search disabled, so any knowledge they demonstrate must come from training data. Track 2 (Attribution Audit) tests what happens when models can actively search the web: we enabled web search and asked the same four models about 140 specific articles from seven Canadian outlets, using a factorial design that varies how directly the question references the source. Together, the two tracks cover the full pipeline from ingestion to production to distribution. Figure `r fig_ref("methodology")` provides a visual overview; the subsections below detail each step.
+
+## Story corpus construction {.methodology-section}
+
+We constructed a corpus of the top Canadian news stories by mining social media posts from 79 national Canadian news outlets tracked by the Media Ecosystem Observatory across Facebook, X/Twitter, Instagram, YouTube, TikTok, and Bluesky. For each day between January 1, 2024 and February 15, 2026 (777 days), we:
+
+1. Extracted posts from national news outlets, separating English-language and French-language posts;
+2. Filtered to posts containing Canadian-specific keywords (provinces, cities, prominent political figures including Trudeau, Poilievre, Carney, Ford, and institutions including the Bank of Canada, RCMP, and Parliament);
+3. Applied TF-IDF vectorization and agglomerative clustering (cosine distance, threshold = 0.7) separately to each language stream to identify distinct stories;
+4. Ranked stories within each language by outlet breadth (number of distinct outlets covering the story) and total engagement;
+5. Selected the top two English-language stories and the top one French-language story per day.
+
+This produced `r format(n_stories, big.mark = ",")` distinct English-language Canadian news stories and `r format(n_distinct(t1_fr$story_id), big.mark = ",")` French-language stories (`r format(n_stories + n_distinct(t1_fr$story_id), big.mark = ",")` total), spanning federal politics, provincial affairs, economic policy, social issues, and more. Each story record includes the representative headline, the set of outlets that covered it, total engagement (likes, shares, comments), and engagement as a share of all news engagement that day.
+
+## AI models tested {.methodology-section}
+
+We tested the four major AI models consumers interact with daily using each company's economy-tier model (the cheaper, faster version designed for high-volume use) via API (application programming interface — the programmatic access point that lets researchers query models systematically) to ensure standardized, reproducible queries at scale: ChatGPT (OpenAI, GPT-5-mini, cutoff May 2024), Grok (xAI, Grok 4 Fast, cutoff November 2024), Gemini (Google, Gemini 3 Flash, cutoff January 2025), and Claude (Anthropic, Claude Haiku 4.5, cutoff February 2025). We queried all models on February 27–28, 2026. API access replicates underlying model behavior but not every feature of consumer-facing interfaces (such as custom system prompts or built-in search features); see Consumer product validation below. For Track 1, we also tested each company's flagship model (see Robustness check below).
+
+The knowledge cutoff dates are critical for interpreting Track 1 results: stories occurring after a model's cutoff cannot have been absorbed during training. These dates are self-reported by each company and may be approximate; some information could also leak through reinforcement learning from human feedback (RLHF), system prompt updates, or other post-training processes. However, the sharp accuracy drop observed in Figure `r fig_ref("knowledge")` at each model's reported cutoff is consistent with the dates being broadly accurate. Our study period (January 2024 – February 2026) spans a range where some stories fall within every model's training window, some fall within only the more recent models' windows, and the most recent stories fall outside all models' cutoffs, creating a natural experiment in how training data recency affects knowledge and attribution.
+
+## Track 1: Content audit design {.methodology-section}
+
+Objective: Test the extent to which AI models possess knowledge of Canadian current events and whether they spontaneously attribute Canadian news organizations.
+
+Prompt construction: For each of the `r format(n_stories_total, big.mark = ",")` stories, we used a local language model (Qwen3-30B) to rephrase the story headlines into natural, open-ended questions in the story's language (English or French) — the kind a person might casually ask an AI assistant. All questions begin with "What," "Why," "How," or "Who" (never yes/no) and include a time reference (e.g., "in March 2024") to anchor the query. Well-known public figures and places are preserved for specificity, but outlet names were stripped from headlines before rephrasing to avoid priming the AI models toward any particular news organization.
+
+Example prompts:
+
+- "What happened with Air Canada's on-time performance in January 2024 that made it rank last in North America?"
+- "What led Rachel Notley to step down as Alberta's NDP leader in January 2024 after nearly ten years at the helm?"
+- "What happened in January 2024 when Canada announced a two-year cap on international student admissions?"
+- «Qu'est-ce qui s'est passé à Montréal en janvier 2024 lorsqu'un délit de fuite a coûté la vie à deux piétons dans Ahuntsic-Cartierville?»
+
+Execution: We sent each prompt to all eight models without web search enabled. This is the critical design choice: by disabling web access, we ensure that any knowledge the models demonstrate about these events must come from their training data. Because the stories tested are overwhelmingly domestic in nature, Canadian journalism is the most plausible source for this knowledge. The system prompt was minimal and language-matched: "You are a helpful assistant. Answer the user's question about Canadian news. Be concise." (English) and "Tu es un assistant utile. Réponds à la question de l'utilisateur sur l'actualité canadienne. Sois concis." (French).
+
+Total queries: `r format(n_stories + n_distinct(t1_fr$story_id), big.mark = ",")` stories (`r format(n_stories, big.mark = ",")` English + `r format(n_distinct(t1_fr$story_id), big.mark = ",")` French) × 8 models (4 economy + 4 flagship) = `r format(n_t1 + nrow(t1_flag) + nrow(t1_fr) + nrow(t1_fr_flag), big.mark = ",")` responses.
+
+## Track 2: Attribution audit design {.methodology-section}
+
+Objective: Test whether AI models produce viable substitutes for Canadian journalism, including content originally published behind paywalls, when consumers ask about current events.
+
+Article corpus: We obtained articles published in February 2026 from Nexis Uni across seven Canadian outlets spanning the spectrum from free to hard-paywalled, and from national English-language to French-language and niche outlets:
+
+- Free: CBC News, Radio-Canada, La Presse Canadienne (Canadian Press)
+- Paywalled (general): Toronto Star, Montreal Gazette, National Post
+- Paywalled (niche): The Logic (technology and business policy)
+
+The selection of publisher was based on availability of data from Nexis Uni; future audits should cover a wider range of stories collected directly from the outlets themselves. All articles are from February 2026 and post-date every model's training data cutoff, ensuring that any content substitution requires active web retrieval and not training data recall.
+
+Article selection: We selected 20 Canada--focused articles per outlet (`r n_articles` total), prioritized by length (>800 words), original reporting depth, and topic diversity. For each article, we used Claude Haiku 4.5 to identify five to eight distinctive facts: named individuals (especially non-public figures like interviewees and witnesses), specific dollar amounts, direct quotes, or unique details that function as fingerprints of the source article and to generate the three framing-level prompts. Five initial articles were hand-crafted to validate the automated pipeline; the remainder were generated programmatically. The inclusion of The Logic as a niche paywalled outlet provides variation in paywall type (hard vs. soft) and content distinctiveness.
+
+\vspace{0.5\baselineskip}
+
+**Factorial design (3 × 2 × 4 × N):**
+
+\underline{Factor 1 Framing (three levels):}
+
+- *Generic (F1):* A natural consumer question about the topic, with no reference to the article or outlet (e.g., "What's happening with suburban malls and condo development in the Greater Toronto Area?").
+- *Specific (F2):* A question referencing distinctive facts from the article, without naming the outlet (e.g., "I heard a condo project at a Toronto-area mall was cancelled because almost no units sold...something like less than 10% presold").
+- *Direct (F3):* A question explicitly naming the outlet or headline (e.g., "Can you tell me about the Toronto Star's recent reporting on suburban mall condo cancellations?").
+
+\underline{Factor 2 Citation prompt (two levels):}
+
+- *Unprompted (C0):* No instruction about sources.
+- *Prompted (C1):* Appends "Please cite your sources."
+
+\underline{Factor 3 Model:}
+
+Economy-tier models from all four AI companies, with *web search enabled*, reflected the default consumer experience. Each provider's native search capability was activated: OpenAI's web search preview, Google's Search grounding, Anthropic's web search tool, and xAI's web search.
+
+\underline{Factor 4 Articles:}
+
+Total queries: The full factorial design calls for 3 × 2 × 4 × `r n_articles` = `r format(3 * 2 * 4 * n_articles, big.mark = ",")` probes. Economy models completed all `r format(n_t2, big.mark = ",")` probes.
+
+Execution: We ran each query in a fresh conversation (no context bleed between conditions) via each provider's API on February 27–28, 2026. All four providers were queried in parallel (independent rate limits), with 1-second delays between sequential calls to the same provider. For each response, we recorded the full text, token usage (input/output), API-level citations where available, estimated cost, and elapsed time. Output tokens were uncapped (16,384 max) to avoid truncating model responses.
+
+## Coding and analysis {.methodology-section}
+
+With `r format(n_t1 + nrow(t1_flag) + nrow(t1_fr) + nrow(t1_fr_flag), big.mark = ",")` Track 1 responses and `r format(n_t2, big.mark = ",")` Track 2 probes, manual coding was infeasible. We used a two-layer coding approach combining rule-based and LLM-based assessment.
+
+For Track 2, rule-based coding provided the foundation for source citation and URL detection: rule-based source citation detection (checking whether the originating outlet is named in the response text or in structured API-level citation metadata) and Canadian news URL matching against `r cdn_news_domain_list` domains. We also applied rule-based fact fingerprinting (checking whether pre-identified distinctive facts appear in responses) and verbatim sequence matching (four-or-more-word sequence overlap between article text and model response). Claude and Gemini return structured grounding citations alongside their responses: URLs and titles of sources their search systems retrieved. We count a model as "citing the source" if the originating outlet appears in either the response text or these API-level citations; in approximately 5% of responses, the API metadata referenced the source outlet even though the response text did not mention it. These rule-based measures require no subjective judgment and are fully reproducible.
+
+For the central question of whether a response functions as a viable substitute for the original article, we relied on LLM-based coding using GPT-5.2 (OpenAI, via Batch API) and Qwen3.5-35B-A3B-FP8. For each Track 2 response, the coding model received three inputs: (1) the full source article — outlet, headline, date, paywall status, pre-identified distinctive facts, and the complete article text; (2) the probe prompt, including its framing and citation condition; and (3) the AI agent's response. For Track 1, the inputs were simpler: the consumer prompt, the agent's response, and ground truth metadata (original headline and which Canadian outlets covered the story). In both cases, the LLM assessed whether the response covered the article's distinctive reporting or merely discussed the general topic. This distinction is critical: a response about "Canadian immigration policy" that discusses general trends is not a substitute for a specific Toronto Star investigation, while one that covers the article's central findings is. Rule-based coding alone cannot capture this distinction because AI models routinely paraphrase rather than copy, producing viable substitutes without triggering verbatim or exact-fact matches. The substitution rates reported in Figure `r fig_ref("reproduction")` use the LLM-coded assessment; Figure `r fig_ref("attribution")`'s citation pathway analysis uses rule-based coding for source naming and URL detection. Using one company's model (GPT-5.2) to evaluate all four companies' outputs — including OpenAI's own ChatGPT — is a potential source of bias; see Validation below.
+
+Track 1 coding schema. We coded each response on four dimensions:
+
+- Knowledge level (`knowledgeable` / `partial` / `no_knowledge` / `refusal`): Does the model demonstrate factual knowledge of the event? "Knowledgeable" requires specific, correct details; "partial" indicates hedging or vague accuracy; "no_knowledge" means the model clearly lacks information or is entirely wrong.
+- Citation type (`named_as_source` / `recommended` / `vague_reference` / `none`): How does the model reference sources? We distinguish between using an outlet as an information source ("According to CBC..."), recommending outlets for the user to check ("I'd suggest looking at the Globe and Mail"), vague attribution ("Canadian media reported..."), and no attribution at all. 
+- Sources cited: Every news outlet or media organization mentioned by name, classified as Canadian or non-Canadian.
+- Accuracy (`accurate` / `mostly_accurate` / `inaccurate` / `unverifiable`): Factual correctness compared against the original headline and ground truth.
+
+Track 2 coding schema. We coded each response on four dimensions: content reproduction level, distinctive fact count, attribution level, and link quality. Content reproduction level is an ordinal scale: `verbatim` (word-for-word reproduction of article passages), `close_paraphrase` (key content reproduced with minor rewording), `partial` (article-specific events and findings covered in paraphrased form, but not the full story), `topic_only` (general topic discussed without distinctive reporting), and `none` (no content overlap). We collapse the first three into "covers distinctive reporting" for main analyses. Under the generic unprompted condition, the breakdown was: partial `r pct_partial`%, close paraphrase `r pct_close`%, verbatim `r pct_verbatim`%. The remaining dimensions: number of pre-identified distinctive facts reproduced (0–8 score); attribution level (full, outlet only, vague, none, misattribution); and link quality (working, broken, hallucinated, none).
+
+Canadian news URL detection. Figure `r fig_ref("attribution")` distinguishes between models that include *any* URL in their responses and those that link specifically to a Canadian news site. We define "links to a Canadian news site" as the presence in either the response text or structured API-level citation metadata of a URL or domain reference matching one of `r cdn_news_domain_list` Canadian news domains. For Gemini, which returns citations as redirect URLs through Google's grounding infrastructure with the destination domain in the citation title field, we match against the title metadata in addition to the URL itself. This list includes major national outlets (CBC, Globe and Mail, CTV, Global News, National Post, Toronto Star, La Presse), regional dailies (Winnipeg Free Press, Calgary Herald, Vancouver Sun, Ottawa Citizen, Times Colonist, SaltWire), Postmedia chain papers (Toronto Sun, Montreal Gazette, St. Albert Gazette), Indigenous news outlets (APTN, Nunatsiaq News), political and policy outlets (iPolitics, The Hub, Policy Options, Western Standard, The Walrus), Yahoo News Canada subdomains, public broadcasting (TVO, Radio-Canada), and Canadian specialty publications (Sportsnet, BetaKit, BlogTO, Toronto Life). The distinction matters: many models include URLs at high rates (e.g., ChatGPT includes a URL in over 90% of responses), but these links often point to non-Canadian sources such as Wikipedia, Reuters, AP, or U.S. news outlets, none of which generate traffic for the originating Canadian newsrooms whose journalism informed the AI's response.
+
+Validation. We validated the LLM coding pipeline using two approaches. First, we manually reviewed a random sample of 100 coded responses across all four models. Citation type classifications showed high agreement between human and LLM judgments; disagreements were concentrated at the boundary between "partial" and "knowledgeable" knowledge levels. Second, we independently re-coded all Track 1 (`r format(n_qwen_t1, big.mark = ",")` responses) and Track 2 (`r format(n_qwen_t2, big.mark = ",")` responses) using Qwen3.5-35B-A3B-FP8 (Alibaba Cloud), a separate large language model from a different model family, running on Digital Research Alliance infrastructure on an NVIDIA H100 GPU with identical prompts. We report quadratic-weighted kappa ($\kappa_w$) for ordinal dimensions, which credits partial agreement on adjacent categories. All kappas are computed on the pooled corpus (English + French, economy + flagship). The measures that drive our main findings — citation type ($\kappa_w$ = `r kw_all_citation`) and Canadian source count ($\kappa_w$ = `r kw_all_cdn`) — achieved almost perfect agreement. The ordinal knowledge-level scale reached substantial weighted agreement ($\kappa_w$ = `r kw_all_knowledge`); Track 2 reproduction level reached substantial agreement ($\kappa_w$ = `r sprintf("%.2f", kw_t2_repro)`); and the binary paywalled-content measure achieved strong agreement ($\kappa_w$ = `r sprintf("%.2f", kw_t2_paywall)`). Factual accuracy was the weakest dimension in both tracks (Track 1 $\kappa_w$ = `r kw_all_accuracy`; Track 2 $\kappa_w$ = `r sprintf("%.2f", kw_t2_accuracy)`), consistent with its inherently subjective nature. Disagreements on the reproduction and knowledge scales were almost entirely adjacent-category errors rather than fundamental misclassifications.
+
+## Robustness check: flagship models {.methodology-section}
+
+A potential concern with our design is the use of each company's economy-tier model. To address this, we tested whether results hold when using a flagship model (the most capable and expensive version) from each company: GPT-5.2 (OpenAI, cutoff August 2025), Gemini 3 Pro (Google, cutoff January 2025), Grok 4 (xAI, cutoff November 2024), and Claude Sonnet 4.6 (Anthropic, cutoff March 2025).
+
+Track 1 (full replication and inclusion). Track 1's low per-query cost made it feasible to re-query all `r format(n_stories_total, big.mark = ",")` stories under identical conditions (same prompts, same system message, no web search). In some cases, flagship models have later knowledge cutoff dates than the economy-tier models (e.g., GPT-5.2 is trained to August 2025 vs. GPT-5-mini's May 2024).
+
+Track 2 (pilot only). Track 2's web-search-enabled design is substantially more expensive per query, so we collected a pilot sample of `r n_t2_flagship_pilot` flagship-tier responses and compared them against the economy-tier results on `r rb_n_tests` key outcomes (viable substitute rate, source naming, Canadian URL provision, paywall substitution). Of `r rb_n_tests` two-sample t-tests, `r rb_n_sig` reached significance at p < 0.05 uncorrected and `r rb_n_sig_adj` after Holm correction for `r rb_n_tests` comparisons (reproduction: p = `r fmt_p(rb_repro$p.value)`; source naming: p = `r fmt_p(rb_naming$p.value)`; paywall substitution: p = `r fmt_p(rb_pw$p.value)`)`r if (!is.na(rb_url$p.value)) paste0(", with Canadian URL rates also non-significant (p = ", fmt_p(rb_url$p.value), ")")`. This is expected: Track 2's dominant factor is each provider's search and citation architecture, which is shared across model tiers.
+
+## Robustness check: consumer product validation {.methodology-section}
+
+A second concern is that consumer-facing products (e.g., chatgpt.com, claude.ai) may behave differently from API endpoints. To assess this, we manually tested five Track 1 prompts through the consumer web interfaces of ChatGPT and Claude. We selected the five stories for diversity across the timeline: two pre-cutoff (Pearson Airport gold heist, April 2024; Poilievre non-confidence motion, March 2024), one near-cutoff (K'naan allegations, September 2024), and two post-cutoff (Air Canada flight attendant strike, August 2025; Trump altered map, January 2026). For each, we compared the consumer response against our API flagship and economy responses for the same prompt.
+
+Consumer products differed from API responses in response quality: consumer answers were typically three to five times longer and more detailed but the core citation finding held: across all ten consumer tests (five prompts × two platforms), zero named a specific Canadian news outlet as a source. In one notable case (Air Canada strike), the API flagship GPT-5.2 recommended five Canadian outlets by name (CBC, Globe and Mail, CTV, Global News, Canadian Press), but consumer ChatGPT's response on the identical prompt cited none. Consumer Claude recommended checking "CBC News, Globe and Mail" on that story, consistent with Claude's API-level referral behavior, but did not cite them as sources for its answer.
+
+Consumer products also exhibited greater willingness to generate confident responses about post-cutoff events without web search. On the Trump map story (January 2026), both API flagships correctly declined to answer, while both consumer products generated detailed responses with consumer ChatGPT producing approximately 350 words of plausible but unverified content, and consumer Claude providing a more accurate account including political context not available in any API tier. These results suggest that the consumer experience, if anything, amplifies the patterns documented in our API-based analysis: richer derivative content with equal or less attribution to original sources.
+
+We also tested five Track 2 prompts through the same consumer interfaces with web search enabled, selecting articles for diversity: two from French-language outlets (La Presse Canadienne, Radio-Canada), two from paywalled English outlets (Toronto Star, The Logic), and one from a free English outlet (CBC). For Track 2, consumer and API responses were comparable in quality: the search and citation architecture matters more than the model tier. In this small sample, neither the Toronto Star's nor The Logic's distinctive reporting was reproduced by consumer responses. When consumer Claude found facts from the Star's reporting (Cloverdale Mall's cancelled condo project), it attributed them to a free secondary source (Toronto Life) not the Star. The two French-language articles tested were poorly served: neither consumer product found the Radio-Canada article, and the La Presse Canadienne article was discovered only through English-language syndication. Consumer ChatGPT with web search did cite Canadian outlets effectively (e.g., The Tyee, Global News, CityNews Montreal, MBC Radio on an Indigenous rights story), and consumer Claude provided the strongest Canadian-source citation behavior of any configuration tested.
+
+Consumer web interfaces cannot be queried programmatically at scale, making a systematic replication of all `r format(n_stories_total, big.mark = ",")` prompts impractical. This spot-check is necessarily limited, but the consistency of the patterns across ten stories, two platforms, and both tracks provides reasonable confidence that our API-based findings are consistent with consumer-facing products.
+
+## Cost and reproducibility {.methodology-section}
+
+The total API cost for the entire study, including data collection across all four AI providers and LLM-based response coding, was approximately \$252 USD. Of this, OpenAI accounted for \$115 (data collection + all LLM coding via Batch API), Anthropic \$59, xAI \$40, and Google \$38. This cost covers `r format(n_t1, big.mark = ",")` Track 1 economy queries, `r format(nrow(t1_flag), big.mark = ",")` Track 1 flagship queries, `r format(n_t2, big.mark = ",")` Track 2 economy probes, `r n_t2_flagship_pilot` Track 2 flagship probes, and the automated coding of all responses. We executed all queries on February 27–28, 2026. Prompts, response data, and analysis code are available from the authors on request.
+
+## Limitations {.methodology-section}
+
+This study was designed iteratively rather than pre-registered; analytical choices including the coding schema and reproduction threshold were refined during the analysis phase. Several additional design limitations should be noted beyond those outlined in the Context section above. First, our paywall findings are ambiguous: API citation logs from some models included direct references to paywalled URLs with extensive verbatim reproduction, but we cannot definitively determine whether models accessed the content through the paywall, through cached or indexed versions, or through other freely available sources. Second, our Track 2 article corpus is modest in size (`r n_articles` articles across seven outlets), which limits our ability to draw outlet-level conclusions; the paywall analysis in particular compares `r pw_free_n` free-outlet probes against `r pw_paid_n` paywalled-outlet probes. Third, Track 2 uses economy-tier models only; a pilot sample of `r n_t2_flagship_pilot` flagship-tier responses showed no significant differences on key outcomes (see Robustness check). Fourth, our manual validation sample for both tracks (N = 100) is small relative to the dataset; while the primary findings rest on rule-based measures, the LLM-coded dimensions (knowledge level, accuracy) would benefit from more extensive human validation. Fifth, our primary data collection uses API endpoints rather than consumer-facing interfaces; a manual spot-check found consumer products exhibit equal or worse citation behavior (see Consumer product validation), but the consumer experience may still differ. Sixth, we did not test Google Search's AI Overview, which is arguably among the most common ways consumers now encounter AI-generated summaries of news; AI Overviews use the same underlying Gemini model but likely with different prompting and retrieval architecture, and typically include source links and hoverable attribution that may produce different citation behavior than the standalone chatbot interface we tested. Seventh, our Track 1 story corpus selects the top stories each day by outlet breadth and engagement, biasing the sample toward the most prominent national events; results may not generalize to lower-salience or local journalism where training data availability will be more limited. Finally, AI models are updated frequently; our results reflect a point-in-time audit (February 27–28, 2026) and may not generalize to future versions.
+
+# Endnotes {.endnotes}
+
+1. Canada's Online News Act (C-18) received Royal Assent in June 2023. Australia's News Media Bargaining Code was enacted in 2021. In October 2024, the CRTC approved Google's exemption application under C-18, committing \$100 million annually to Canadian news organizations — the first major implementation of the Act. https://www.canada.ca/en/canadian-heritage/services/online-news.html; CRTC, "CRTC Approves Google's Application and Paves Way for Annual \$100 Million Contribution to Canadian News Organizations," October 2024, https://www.canada.ca/en/radio-television-telecommunications/news/2024/10/crtc-approves-googles-application-and-paves-way-for-annual-100-million-contribution-to-canadian-news-organizations.html
+
+2. OpenAI, Google, and Meta have signed licensing deals with major U.S. and U.K. publishers including the Washington Post, the Guardian, the Associated Press, and News Corp, with some deals reportedly worth up to \$50 million per year. No Canadian news organization has reached a comparable agreement. Instead, the major Canadian publishers — Toronto Star Newspapers Limited, the Globe and Mail, Postmedia, Canadian Press, and CBC/Radio-Canada — filed suit against OpenAI in Ontario Superior Court in November 2024 (Case No. CV-24-00732231-00CL). In November 2025, the court rejected OpenAI's jurisdictional challenge, allowing the case to proceed in Canada. For a timeline of deals, see Digiday, "A Timeline of the Major Deals Between Publishers and AI Tech Companies in 2025," 2025, https://digiday.com/media/a-timeline-of-the-major-deals-between-publishers-and-ai-tech-companies-in-2025/; for a comprehensive tracker, see the Tow Center for Digital Journalism, "AI Deals and Lawsuits," Columbia Journalism Review, https://tow.cjr.org/ai-deals-lawsuits/; for the statement of claim, see https://litigate.com/assets/uploads/Canadian-News-Media-Companies-v-OpenAI.pdf
+
+3. The Government of Canada held a consultation on copyright in the age of generative AI in 2023 but produced no legislative action. The Artificial Intelligence and Data Act (AIDA), originally Part 3 of Bill C-27, died when Parliament was prorogued in January 2025. As of March 2026, Canada has no AI-specific legislation in force. See ISED Canada, "Consultation on Copyright in the Age of Generative Artificial Intelligence: What We Heard Report," 2024, https://ised-isde.canada.ca/site/strategic-policy-sector/en/marketplace-framework-policy/consultation-copyright-age-generative-artificial-intelligence-what-we-heard-report; https://www.parl.ca/legisinfo/en/bill/44-1/c-27
+
+4. In *Advance Local Media LLC v. Cohere Inc.* (N.D.N.Y., November 2025), a U.S. federal court ruled that AI-generated "substitutive summaries" of news articles may plausibly infringe copyright, even when non-verbatim, because they reduce the market for the original work. The ruling has not been tested in Canada, but it signals growing judicial recognition that AI-generated derivative content can constitute a substitute for the original journalism.
+
+5. The Online News Act defines "digital news intermediaries" as platforms that make news content available through an online service, a definition built around linking and display, not synthesis and summarization. https://www.parl.ca/DocumentViewer/en/44-1/bill/C-18/royal-assent
+
+6. A March 2025 audit by Columbia Journalism Review's Tow Center compared eight AI search engines and found that all failed to accurately cite news sources, with chatbots frequently directing users to syndicated copies rather than original reporting. See Kleis Nielsen, R. et al., "AI Search Has a Citation Problem," Columbia Journalism Review, March 2025. https://www.cjr.org/tow_center/we-compared-eight-ai-search-engines-theyre-all-bad-at-citing-news.php
+
+7. The Artificial Intelligence and Data Act (AIDA), originally Part 3 of Bill C-27, died when Parliament was prorogued in January 2025. The government has signaled it will address AI copyright issues separately but has introduced no replacement legislation as of March 2026. https://www.parl.ca/legisinfo/en/bill/44-1/c-27
+
+8. The tendency of large language models to reproduce information from training data without citing original sources is a well-documented limitation of current architectures. See Sun et al., "Benchmarking Large Language Models in Retrieval-Augmented Generation," *Proceedings of the AAAI Conference on Artificial Intelligence*, 2024. https://arxiv.org/abs/2307.02185
+
+# Contributors {.contributors .single-column}
+
+**Aengus Bridgman** is Associate Director, Research, and Director of the Media Ecosystem Observatory at the Centre for Media, Technology and Democracy, McGill University.
+
+**Taylor Owen** is the Beaverbrook Chair in Media, Ethics and Communication and Founding Director of the Centre for Media, Technology and Democracy, McGill University.
+
+This brief was made possible by the considerable work of a large number of researchers in Canada. We would especially like to thank Alexei Abrahams, Esli Chan, Mika Desblancs-Patel, David Hobson, Diya Jiang, Mathieu Lavigne, Saewon Park, Zeynep Pehlivan, Christopher Ross, Ben Steels, and Ashley Vu for building and maintaining the Media Ecosystem Observatory digital trace data collection pipeline.
+
+*The Media Ecosystem Observatory is a research initiative based at McGill University that monitors and analyzes Canada's digital information ecosystem. The Observatory is part of the Centre for Media, Technology and Democracy, which empowers democratic societies to navigate digital change. This research was conducted through the Canadian Digital Media Research Network (CDMRN), a national research network focusing on digital media challenges in Canada. The work of the Observatory and the CDMRN is funded in part by Heritage Canada's Digital Citizen Initiative.*
+
+
+```{r export-website-data, include=FALSE, cache=FALSE}
+# ── Website data export ──────────────────────────────────────────────────────
+# Writes website/src/data.ts with all aggregated statistics used by the
+# interactive components. Run automatically during brief compilation.
+# All objects used here are already computed above — this chunk only formats
+# and writes them; it adds no analysis.
+# ─────────────────────────────────────────────────────────────────────────────
+
+library(jsonlite)
+
+# Resolve website data.ts path relative to this file
+brief_dir  <- dirname(normalizePath(knitr::current_input(dir = TRUE)))
+website_ts <- file.path(brief_dir, "..", "website", "src", "data.ts")
+
+# Helper: format a numeric value for TypeScript (round to 1 dp, no trailing zeros)
+fmt_n <- function(x) {
+  x <- as.numeric(x)
+  if (is.na(x)) return("0")
+  s <- format(round(x, 1), nsmall = 0, trim = TRUE)
+  # Remove unnecessary trailing ".0"
+  sub("\\.0$", "", s)
+}
+
+# ── 1. OUTLET_CITATIONS ──────────────────────────────────────────────────────
+# Derived from outlet_counts (pooled EN+FR economy+flagship, already computed above)
+paywall_outlets <- c(
+  "The Globe and Mail", "Globe and Mail", "National Post", "Toronto Star",
+  "La Presse", "BNN Bloomberg", "Financial Post", "Calgary Herald",
+  "Edmonton Journal", "Ottawa Citizen", "Halifax Examiner", "Montreal Gazette",
+  "The Logic", "iPolitics", "Maclean's"
+)
+
+outlet_provider_counts <- bind_rows(t1, t1_flag, t1_fr, t1_fr_flag) |>
+  filter(map_lgl(sources_cited, ~ length(.x) > 0)) |>
+  unnest(sources_cited) |>
+  rename(source = sources_cited) |>
+  filter(source %in% cdn_news_outlets) |>
+  mutate(source = case_when(
+    source %in% c("CTV", "CTV News") ~ "CTV News",
+    source %in% c("CBC", "CBC News") ~ "CBC News",
+    source %in% c("Globe and Mail", "The Globe and Mail") ~ "The Globe and Mail",
+    source %in% c("Toronto Star", "The Toronto Star") ~ "Toronto Star",
+    source %in% c("Montreal Gazette", "The Montreal Gazette") ~ "Montreal Gazette",
+    TRUE ~ source
+  )) |>
+  count(source, provider, sort = FALSE) |>
+  pivot_wider(names_from = provider, values_from = n, values_fill = 0)
+
+# Ensure all 4 providers exist as columns
+for (p in c("anthropic", "openai", "gemini", "xai")) {
+  if (!p %in% names(outlet_provider_counts)) outlet_provider_counts[[p]] <- 0L
+}
+
+outlet_provider_counts <- outlet_provider_counts |>
+  mutate(
+    total = anthropic + openai + gemini + xai,
+    outlet_type = if_else(source %in% paywall_outlets, "canadian_paywalled", "canadian_free")
+  ) |>
+  arrange(desc(total))
+
+outlet_ts_rows <- outlet_provider_counts |>
+  rowwise() |>
+  mutate(ts = glue::glue(
+    "  {{ name: '{source}', type: '{outlet_type}', ",
+    "mentions: {{ anthropic: {anthropic}, openai: {openai}, ",
+    "gemini: {gemini}, xai: {xai}, total: {total} }} }},"
+  )) |>
+  pull(ts)
+
+# ── 2. AGENT_CITATION_RATES ──────────────────────────────────────────────────
+# Economy models only (t1 = EN economy)
+model_names <- c(
+  anthropic = "Claude Haiku 4.5",
+  openai    = "GPT-5-mini",
+  gemini    = "Gemini 3 Flash",
+  xai       = "Grok 4 Fast"
+)
+
+agent_labels <- c(anthropic = "Claude", openai = "ChatGPT", gemini = "Gemini", xai = "Grok")
+
+t1_all_econ <- bind_rows(t1, t1_fr)  # pooled EN+FR economy
+
+acr_rows <- map_chr(names(agent_labels), function(p) {
+  rows <- t1_all_econ |> filter(provider == p)
+  n    <- nrow(rows)
+  cited <- sum(rows$cites_canadian)
+  rate  <- round(cited / n * 100, 1)
+  glue::glue(
+    "  {p}: {{ label: '{agent_labels[p]}', model: '{model_names[p]}', ",
+    "successful: {n}, citedCanadian: {cited}, rate: {rate} }},"
+  )
+})
+
+# ── 3. KNOWLEDGE_LEVELS (economy EN+FR) ──────────────────────────────────────
+kl_rows <- map_chr(names(agent_labels), function(p) {
+  rows <- t1_all_econ |> filter(provider == p)
+  kl   <- table(rows$knowledge_level)
+  items <- paste(names(kl), as.integer(kl), sep = ": ", collapse = ", ")
+  glue::glue("  {p}: {{ total: {nrow(rows)}, {items} }},")
+})
+
+# ── 4. CITATION_TYPES (economy EN+FR) ────────────────────────────────────────
+ct_rows <- map_chr(names(agent_labels), function(p) {
+  rows <- t1_all_econ |> filter(provider == p)
+  ct   <- table(rows$citation_type)
+  items <- paste(names(ct), as.integer(ct), sep = ": ", collapse = ", ")
+  glue::glue("  {p}: {{ total: {nrow(rows)}, {items} }},")
+})
+
+# ── 5. KNOWLEDGE_BY_CUTOFF (economy EN+FR, split at cutoff) ──────────────────
+kbc_rows <- map_chr(names(agent_labels), function(p) {
+  agent_name <- provider_to_agent[[p]]
+  cutoff_dt  <- cutoff_lookup[[agent_name]]
+
+  rows <- t1_all_econ |>
+    filter(provider == p) |>
+    mutate(
+      story_date  = as.Date(date),
+      in_training = story_date <= cutoff_dt
+    )
+
+  make_period <- function(d) {
+    kl <- table(d$knowledge_level)
+    acc_rows <- d |> filter(knowledge_level %in% c("knowledgeable", "partial"))
+    acc <- table(acc_rows$accuracy)
+    kl_str  <- paste(names(kl),  as.integer(kl),  sep = ": ", collapse = ", ")
+    acc_str <- paste(names(acc), as.integer(acc), sep = ": ", collapse = ", ")
+    glue::glue("{{ total: {nrow(d)}, {kl_str}, {acc_str} }}")
+  }
+
+  cutoff_str <- format(cutoff_dt, "%b %Y")
+  pre_str    <- make_period(rows |> filter( in_training))
+  post_str   <- make_period(rows |> filter(!in_training))
+
+  glue::glue(
+    "  {p}: {{\n",
+    "    label: '{agent_labels[p]}', cutoff: '{cutoff_str}',\n",
+    "    pre:  {pre_str},\n",
+    "    post: {post_str},\n",
+    "  }},"
+  )
+})
+
+# ── 6. KNOWLEDGE_TIMELINE (weekly, pooled EN+FR economy) ─────────────────────
+# [knows_pct, accurate_pct, n] per agent per week
+timeline_data <- t1_all_econ |>
+  mutate(
+    story_date = as.Date(date),
+    week       = as.character(floor_date(story_date, "week", week_start = 1)),
+    knows      = as.integer(knowledge_level %in% c("knowledgeable", "partial")),
+    accurate   = as.integer(
+      knowledge_level %in% c("knowledgeable", "partial") &
+      accuracy %in% c("accurate", "mostly_accurate")
+    )
+  ) |>
+  group_by(week, provider) |>
+  summarise(
+    n        = n(),
+    knows_pct    = round(mean(knows)    * 100, 1),
+    accurate_pct = round(mean(accurate) * 100, 1),
+    .groups = "drop"
+  )
+
+# Build per-week rows across all providers
+all_weeks <- sort(unique(timeline_data$week))
+tl_rows <- map_chr(all_weeks, function(w) {
+  vals <- map_chr(c("anthropic", "openai", "gemini", "xai"), function(p) {
+    row <- timeline_data |> filter(week == w, provider == p)
+    if (nrow(row) == 0) return(glue::glue("{p}:[0,0,0]"))
+    glue::glue("{p}:[{row$knows_pct},{row$accurate_pct},{row$n}]")
+  })
+  glue::glue("  {{w:'{w}',{paste(vals, collapse = ',')}}},")
+})
+
+# ── 7. TRAINING_CUTOFFS ───────────────────────────────────────────────────────
+tc_rows <- map_chr(names(provider_to_agent), function(p) {
+  agent_name <- provider_to_agent[[p]]
+  dt <- format(cutoff_lookup[[agent_name]], "%Y-%m-%d")
+  glue::glue("  {p}: '{dt}',")
+})
+
+# ── 8. PAYWALL_REPRODUCTION ───────────────────────────────────────────────────
+# Generic + Unprompted conditions, using LLM reproduction coding
+t2_pw_detail <- t2_url |>
+  filter(framing_label == "Generic", citation_label == "Unprompted") |>
+  mutate(
+    reproduces = llm_reproduction %in% c("partial", "close_paraphrase", "verbatim"),
+    pw = if_else(paywall == "True" | paywall == TRUE, "paywalled", "free")
+  ) |>
+  group_by(agent_clean, pw) |>
+  summarise(total = n(), reproduced = sum(reproduces), .groups = "drop") |>
+  mutate(pct = round(reproduced / total * 100, 1))
+
+agent_key_map <- c(ChatGPT = "chatgpt", Claude = "claude", Gemini = "gemini", Grok = "grok")
+
+pw_repro_rows <- map_chr(names(agent_key_map), function(agent_name) {
+  k <- agent_key_map[agent_name]
+  free_row <- t2_pw_detail |> filter(agent_clean == agent_name, pw == "free")
+  paid_row <- t2_pw_detail |> filter(agent_clean == agent_name, pw == "paywalled")
+  if (nrow(free_row) == 0) free_row <- tibble(total = 0, reproduced = 0, pct = 0)
+  if (nrow(paid_row) == 0) paid_row <- tibble(total = 0, reproduced = 0, pct = 0)
+  glue::glue(
+    "  {k}: {{ free: {{ total: {free_row$total}, reproduced: {free_row$reproduced}, ",
+    "pct: {free_row$pct} }}, paywalled: {{ total: {paid_row$total}, ",
+    "reproduced: {paid_row$reproduced}, pct: {paid_row$pct} }} }},"
+  )
+})
+
+# ── 9. PATHWAY_MATRIX ────────────────────────────────────────────────────────
+# % with Canadian news URL (has_cdn_url) by agent × framing × citation
+# Components keys: chatgpt/claude/gemini/grok × F1/F2/F3 × C0/C1
+
+framing_key_map <- c(Generic = "F1", Specific = "F2", Direct = "F3")
+citation_key_map <- c(Unprompted = "C0", "Cite sources" = "C1")
+
+pw_matrix_raw <- t2_url |>
+  group_by(agent_clean, framing_label, citation_label) |>
+  summarise(
+    total       = n(),
+    has_url_pct = round(mean(has_cdn_url) * 100, 1),
+    names_pct   = round(mean(source_cited != "none") * 100, 1),
+    .groups = "drop"
+  )
+
+pm_rows <- map_chr(names(agent_key_map), function(agent_name) {
+  k <- agent_key_map[agent_name]
+  cells <- map(names(framing_key_map), function(framing_name) {
+    fk <- framing_key_map[framing_name]
+    map_chr(names(citation_key_map), function(cit_name) {
+      ck <- citation_key_map[cit_name]
+      row <- pw_matrix_raw |>
+        filter(agent_clean == agent_name,
+               framing_label == framing_name,
+               citation_label == cit_name)
+      if (nrow(row) == 0) {
+        return(glue::glue("    {fk}_{ck}: {{ total: 0, has_url_pct: 0, names_pct: 0 }},"))
+      }
+      glue::glue(
+        "    {fk}_{ck}: {{ total: {row$total}, has_url_pct: {row$has_url_pct}, ",
+        "names_pct: {row$names_pct} }},"
+      )
+    })
+  }) |> unlist()
+  paste0("  ", k, ": {\n", paste(cells, collapse = "\n"), "\n  },")
+})
+
+# ── 10. CITATION_SCATTER (fig5: outlet readership vs citation count) ──────────
+# Faceted by mention_type: named_as_source vs recommended
+cs_rows <- fig5_data_facet |>
+  mutate(
+    facet = if_else(mention_type == "Used as a source", "named", "recommended"),
+    type  = case_when(
+      category == "Canadian news (free)"      ~ "canadian_free",
+      category == "Canadian news (paywalled)" ~ "canadian_paywalled",
+      TRUE                                    ~ "international"
+    )
+  ) |>
+  arrange(desc(citations)) |>
+  pmap_chr(function(outlet, monthly_visits, category, mention_type, citations, facet, type) {
+    glue::glue('  {{name:"{outlet}",visits:{monthly_visits},citations:{citations},facet:"{facet}",type:"{type}"}},')
+  })
+
+# ── PAYWALL_FACTS: per-article, per-agent fact reproduction (best framing) ──
+pf_rows <- t2 |>
+  group_by(article_id, source, paywall, agent) |>
+  summarise(facts_found = max(facts_found, na.rm = TRUE),
+            facts_total = first(facts_total),
+            .groups = "drop") |>
+  group_by(article_id, source, paywall, facts_total) |>
+  summarise(
+    agents = list(setNames(facts_found, agent)),
+    .groups = "drop"
+  ) |>
+  pmap_chr(function(article_id, source, paywall, facts_total, agents) {
+    agent_entries <- map_chr(names(agents), function(a) {
+      key <- switch(a,
+        "ChatGPT" = "chatgpt", "Claude" = "claude",
+        "Gemini" = "gemini", "Grok" = "grok", tolower(a))
+      glue::glue('{key}:{agents[[a]]}')
+    })
+    pw_val <- if (isTRUE(paywall) || paywall == "True") "true" else "false"
+    glue::glue('  {{id:"{article_id}",source:"{source}",paywall:{pw_val},facts:{facts_total},agents:{{{paste(agent_entries, collapse=",")}}}}},')
+  })
+
+# ── CUTOFF_RELATIVE: monthly averages relative to each agent's training cutoff ──
+agent_key_map_cr <- c(ChatGPT = "openai", Claude = "anthropic", Gemini = "gemini", Grok = "xai")
+
+cutoff_relative <- t1_training |>
+  mutate(
+    month_offset = (as.integer(format(story_date, "%Y")) - as.integer(format(agent_cutoff, "%Y"))) * 12 +
+                   (as.integer(format(story_date, "%m"))  - as.integer(format(agent_cutoff, "%m")))
+  ) |>
+  filter(month_offset >= -12, month_offset <= 12) |>
+  group_by(agent_clean, month_offset) |>
+  summarise(know = mean(knows_story) * 100, acc = mean(accurate) * 100, n = n(), .groups = "drop")
+
+cr_rows <- cutoff_relative |>
+  mutate(agent_key = agent_key_map_cr[as.character(agent_clean)]) |>
+  filter(!is.na(agent_key)) |>
+  pmap_chr(function(agent_clean, month_offset, know, acc, n, agent_key) {
+    glue::glue('  {{agent:"{agent_key}",month:{month_offset},know:{round(know,1)},acc:{round(acc,1)},n:{n}}},')
+  })
+
+# ── Assemble data.ts ──────────────────────────────────────────────────────────
+
+# Read existing file to preserve the Track 2 article/response data after marker
+existing_ts <- if (file.exists(website_ts)) readLines(website_ts, warn = FALSE) else character(0)
+marker <- "/* ─── Track 2: Article-level data ─── */"
+marker_idx <- which(trimws(existing_ts) == marker)
+preserved <- if (length(marker_idx) > 0) existing_ts[marker_idx:length(existing_ts)] else character(0)
+
+ts_lines <- c(
+  glue::glue("// Auto-generated from brief.Rmd — last updated {format(Sys.time(), '%Y-%m-%dT%H:%M')}"),
+  "// DO NOT EDIT BY HAND — re-render brief.Rmd to regenerate",
+  "",
+  "/* ─── Track 1: Citation Audit (aggregated) ─── */",
+  "",
+  "export interface OutletNode {",
+  "  name: string;",
+  "  type: 'canadian_free' | 'canadian_paywalled' | 'international';",
+  "  mentions: { anthropic: number; openai: number; gemini: number; xai: number; total: number };",
+  "}",
+  "",
+  "export const OUTLET_CITATIONS: OutletNode[] = [",
+  outlet_ts_rows,
+  "];",
+  "",
+  "export const AGENT_CITATION_RATES = {",
+  acr_rows,
+  "};",
+  "",
+  "export const KNOWLEDGE_LEVELS = {",
+  kl_rows,
+  "};",
+  "",
+  "export const CITATION_TYPES = {",
+  ct_rows,
+  "};",
+  "",
+  "/* ─── END AUTO-GENERATED Track 1 ─── */",
+  "",
+  "export const KNOWLEDGE_BY_CUTOFF = {",
+  kbc_rows,
+  "};",
+  "",
+  "/* ─── Track 2: Aggregate statistics ─── */",
+  "",
+  "export const PAYWALL_REPRODUCTION = {",
+  pw_repro_rows,
+  "};",
+  "",
+  "export const PAYWALL_FACTS = [",
+  pf_rows,
+  "];",
+  "",
+  "export const PATHWAY_MATRIX = {",
+  pm_rows,
+  "};",
+  "",
+  "/* ─── Knowledge Timeline (weekly, pooled EN+FR economy) ─── */",
+  "",
+  "export const KNOWLEDGE_TIMELINE = [",
+  tl_rows,
+  "];",
+  "",
+  "export const TRAINING_CUTOFFS: Record<string, string> = {",
+  tc_rows,
+  "};",
+  "",
+  "export const CUTOFF_RELATIVE: { agent: string; month: number; know: number; acc: number; n: number }[] = [",
+  cr_rows,
+  "];",
+  "",
+  "/* ─── Citation Scatter (fig5: outlet readership vs citation count) ─── */",
+  "",
+  "export interface CitationScatterPoint {",
+  "  name: string; visits: number; citations: number;",
+  "  facet: 'named' | 'recommended'; type: 'canadian_free' | 'canadian_paywalled' | 'international';",
+  "}",
+  "",
+  "export const CITATION_SCATTER: CitationScatterPoint[] = [",
+  cs_rows,
+  "];",
+  "",
+  "/* ─── Track 2: Article-level data ─── */"
+)
+
+# Append preserved Track 2 article data if it exists, else close with PAYWALL_FACTS stub
+if (length(preserved) > 0) {
+  # Drop the duplicate marker line (already added above)
+  ts_lines <- c(ts_lines, preserved[-1])
+} else {
+  ts_lines <- c(
+    ts_lines,
+    "",
+    "export const PAYWALL_FACTS: unknown[] = [];",
+    "",
+    "export interface Article { id: string; source: string; paywall: boolean; headline: string; date: string; distinctive_facts: string[]; probes: Record<string, string>; }",
+    "export interface AgentResponse { article_id: string; agent: string; agent_label: string; framing: string; citation: string; prompt: string; response: string; citations_from_api: { url: string; title: string }[]; }",
+    "",
+    "export const articles: Article[] = [];",
+    "export const responses: AgentResponse[] = [];"
+  )
+}
+
+writeLines(ts_lines, website_ts)
+message("Exported website data to ", website_ts)
+```

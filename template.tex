@@ -1,0 +1,401 @@
+%% MEO Ecosystem Brief — Pandoc LaTeX template
+%% AI News Audit: clean, spacious, single-accent design
+%% Engine: XeLaTeX (Avenir Next via fontspec)
+
+\documentclass[10pt,letterpaper]{article}
+
+% ─── Page geometry (generous margins) ───
+\usepackage[
+  letterpaper,
+  top=0.75in,
+  bottom=0.8in,
+  left=0.7in,
+  right=0.7in,
+  headheight=30pt,
+  headsep=16pt,
+  footskip=28pt,
+  includeheadfoot
+]{geometry}
+
+% ─── Fonts (Avenir Next via fontspec) ───
+\usepackage{fontspec}
+\setmainfont{Avenir Next}[
+  UprightFont = * Regular,
+  BoldFont = * Bold,
+  ItalicFont = * Italic,
+  BoldItalicFont = * Bold Italic,
+  UprightFeatures = {FontFace = {m}{n}{* Medium}},
+]
+
+% ─── Colors ───
+% Single accent (meogreen) + neutral scale. No competing colors.
+\usepackage[dvipsnames,svgnames,x11names]{xcolor}
+\definecolor{meogreen}{HTML}{467742}
+\definecolor{meosteel}{HTML}{434E7C}
+\definecolor{meobrown}{HTML}{6D4A4D}
+\definecolor{meonearblack}{HTML}{1a1a1a}       % warm off-black (never pure #000)
+\definecolor{meolightgreen}{HTML}{69A849}
+\definecolor{meoorange}{HTML}{FF8200}
+\definecolor{meoteal}{HTML}{6BADC6}
+\definecolor{meogrey}{HTML}{D7D6D4}
+\definecolor{meolightgrey}{HTML}{F5F5F4}
+\definecolor{bodytext}{HTML}{3a3a3a}            % body copy — softer than headlines
+\definecolor{captiontext}{HTML}{5a5a5a}         % captions, metadata
+\definecolor{rulecolor}{HTML}{e0e0e0}           % subtle dividers
+
+% ─── Core packages ───
+\usepackage{multicol}
+\raggedcolumns
+% Place footnotes at absolute page bottom, not below column text
+\makeatletter
+\def\@makecol{%
+  \ifvoid\footins
+    \setbox\@outputbox\vbox to\@colht{%
+      \boxmaxdepth\maxdepth
+      \unvbox\@cclv
+      \vfil}%
+  \else
+    \setbox\@outputbox\vbox to\@colht{%
+      \boxmaxdepth\maxdepth
+      \unvbox\@cclv
+      \vfill
+      \vskip 16pt plus 4pt minus 2pt
+      \color@begingroup
+      \normalcolor
+      \footnoterule
+      \unvbox\footins
+      \color@endgroup}%
+  \fi
+  \xdef\@freelist{\@freelist\@midlist}%
+  \global\let\@midlist\@empty
+  \@combinefloats
+  \ifvbox\@kludgeins
+    \@makespecialcolbox
+  \else
+    \setbox\@outputbox\vbox to\@colht{%
+      \boxmaxdepth\maxdepth
+      \unvbox\@outputbox}%
+  \fi
+  \global\maxdepth\@maxdepth}
+\makeatother
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{colortbl}
+\usepackage{etoolbox}
+\usepackage{tikz}
+\usetikzlibrary{calc}
+\newlength{\coverin}
+\setlength{\coverin}{0.3in}
+\usepackage{calc}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{setspace}
+\usepackage{titletoc}
+
+% ─── Pandoc compatibility ───
+\providecommand{\tightlist}{\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\providecommand{\pandocbounded}[1]{#1}
+
+% Redefine longtable as tabular for multicol compatibility
+\let\longtable\tabular
+\let\endlongtable\endtabular
+\renewcommand{\endhead}{}
+\renewcommand{\endfirsthead}{}
+\renewcommand{\endfoot}{}
+\renewcommand{\endlastfoot}{}
+
+% Pandoc CSL references
+$if(csl-refs)$
+\newlength{\cslhangindent}
+\setlength{\cslhangindent}{1.5em}
+\newlength{\csllabelwidth}
+\setlength{\csllabelwidth}{3em}
+\newenvironment{CSLReferences}[2]{%
+  \setlength{\parindent}{0pt}%
+  \everypar{\setlength{\hangindent}{\cslhangindent}}%
+  \setlength{\parskip}{4pt}%
+  \sloppy
+  \emergencystretch=3em
+  \hyphenpenalty=50
+  \tolerance=9999
+  \setlength{\hfuzz}{2pt}%
+}{}
+\newcommand{\CSLBlock}[1]{#1}
+\newcommand{\CSLLeftMargin}[1]{\parbox[t]{\csllabelwidth}{#1}}
+\newcommand{\CSLRightInline}[1]{\parbox[t]{\linewidth - \csllabelwidth}{#1}}
+\newcommand{\CSLIndent}[1]{\hspace{\cslhangindent}#1}
+$endif$
+
+% ─── URL line-breaking ───
+\usepackage{xurl}
+
+% ─── Hyperlinks ───
+\hypersetup{
+  colorlinks=true,
+  linkcolor=meosteel,
+  urlcolor=meosteel,
+  citecolor=meosteel,
+  pdfauthor={Media Ecosystem Observatory},
+  pdftitle={$title$},
+}
+
+% ─── Paragraph settings ───
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{8pt}
+\setlength{\columnsep}{0.32in}
+
+% Justified text with good hyphenation
+\tolerance=1000
+\emergencystretch=1em
+\hyphenpenalty=50
+
+% ─── Page filling ───
+\raggedbottom
+
+% ─── Default body text color ───
+\color{bodytext}
+
+% ─── Captions ───
+\captionsetup{
+  font={small,color=captiontext},
+  labelfont={bf,color=meonearblack},
+  labelsep=colon,
+  justification=justified,
+  singlelinecheck=false,
+  skip=6pt,
+}
+
+% ═══════════════════════════════════════════════
+% HEADER / FOOTER — minimal, single accent line
+% ═══════════════════════════════════════════════
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+\renewcommand{\headrule}{}
+\renewcommand{\footrule}{}
+
+\fancyhead[C]{%
+  \vbox to 0pt{\vss
+    {\color{meosteel}\rule{\headwidth}{1.5pt}}%
+    \vskip 5pt
+    \hbox to\headwidth{%
+      {\fontsize{7}{9}\selectfont\color{captiontext}%
+       \MakeUppercase{Media Ecosystem Observatory Technical Brief}}%
+      \hfill
+      {\fontsize{7}{9}\selectfont\color{captiontext}%
+       \MakeUppercase{$short_title$}\quad{\color{meonearblack}\bfseries\thepage}}%
+    }%
+  }%
+}
+
+\fancyfoot[C]{%
+  \vbox{%
+    {\color{rulecolor}\rule{\headwidth}{0.5pt}}%
+    \vskip 3pt
+    \hbox to\headwidth{%
+      {\fontsize{6.5}{8}\selectfont\color{captiontext}%
+       meo.ca\enspace\textbar\enspace mediatechdemocracy.com}%
+      \hfill
+    }%
+  }%
+}
+
+% Cover + TOC page style
+\fancypagestyle{empty}{%
+  \fancyhf{}%
+  \renewcommand{\headrulewidth}{0pt}%
+  \renewcommand{\footrulewidth}{0pt}%
+}
+\fancypagestyle{tocstyle}{%
+  \fancyhf{}%
+  \renewcommand{\headrulewidth}{0pt}%
+  \renewcommand{\footrulewidth}{0pt}%
+}
+
+% ─── Section formatting (hierarchy via weight + color, not size) ───
+\titleformat{\section}
+  {\fontsize{18}{22}\bfseries\color{meonearblack}\addfontfeatures{LetterSpace=-2}}
+  {}
+  {0pt}
+  {}
+\titlespacing*{\section}{0pt}{16pt}{10pt}
+
+\titleformat{\subsection}
+  {\fontsize{12}{15}\bfseries\color{meosteel}}
+  {}
+  {0pt}
+  {}
+\titlespacing{\subsection}{0pt}{12pt}{8pt}
+
+\titleformat{\subsubsection}
+  {\fontsize{10}{13}\bfseries\color{meonearblack!70}}
+  {}
+  {0pt}
+  {}
+\titlespacing*{\subsubsection}{0pt}{8pt}{4pt}
+
+% ─── List styling (minimal bullet) ───
+\setlist[itemize]{
+  label={\color{meosteel}\textbullet},
+  leftmargin=1.2em,
+  itemsep=3pt,
+  parsep=1pt,
+}
+
+\setlist[enumerate]{
+  font=\bfseries\color{meonearblack},
+  leftmargin=1.2em,
+  itemsep=3pt,
+  parsep=1pt,
+}
+
+% ─── Blockquote (single green left border, no background box) ───
+\newsavebox{\quotebox}
+\renewenvironment{quote}{%
+  \vspace{6pt}%
+  \noindent\begin{lrbox}{\quotebox}%
+  \begin{minipage}{\dimexpr\linewidth-16pt}%
+  \itshape\fontsize{9}{12.5}\selectfont\color{bodytext}
+}{%
+  \end{minipage}%
+  \end{lrbox}%
+  \noindent%
+  \begin{tikzpicture}[baseline=(quote.base west)]
+    \node[
+      inner xsep=10pt, inner ysep=8pt,
+      anchor=base west,
+    ] (quote) {\usebox{\quotebox}};
+    \fill[meosteel] (quote.north west) rectangle ([xshift=2.5pt]quote.south west);
+  \end{tikzpicture}%
+  \vspace{6pt}%
+}
+
+% ─── Table styling ───
+\arrayrulecolor{rulecolor}
+
+% ─── Pandoc image scaling ───
+\makeatletter
+\def\maxwidth{\ifdim\Gin@nat@width>\linewidth\linewidth\else\Gin@nat@width\fi}
+\def\maxheight{\ifdim\Gin@nat@height>\textheight\textheight\else\Gin@nat@height\fi}
+\makeatother
+\setkeys{Gin}{width=\maxwidth,height=\maxheight,keepaspectratio}
+
+% ─── TOC formatting ───
+\setcounter{tocdepth}{1}
+\titlecontents{section}[0em]
+  {\vspace{4pt}\bfseries\fontsize{10}{13}\selectfont}
+  {}
+  {}
+  {\titlerule*[0.5pc]{.}\contentspage}
+
+% ─────────────────────────────────────────────
+% DOCUMENT
+% ─────────────────────────────────────────────
+\begin{document}
+
+% ═══════════════════════════════════════════════
+% COVER PAGE — clean text-only cover with green accent
+% ═══════════════════════════════════════════════
+\thispagestyle{empty}
+\begin{tikzpicture}[remember picture, overlay]
+
+  % --- Page coordinates ---
+  \coordinate (TL) at (current page.north west);
+  \coordinate (TR) at (current page.north east);
+  \coordinate (BL) at (current page.south west);
+  \coordinate (BR) at (current page.south east);
+
+  % --- Logos (top) ---
+  \IfFileExists{images/meo-logo-en.png}{%
+    \node[anchor=north west] at ([xshift=0.7in, yshift=-0.5in]TL) {%
+      \includegraphics[height=0.45in]{images/meo-logo-en.png}%
+    };
+  }{}
+  \IfFileExists{images/mtd-logo-dark.png}{%
+    \node[anchor=north east] at ([xshift=-0.7in, yshift=-0.5in]TR) {%
+      \includegraphics[height=0.55in]{images/mtd-logo-dark.png}%
+    };
+  }{}
+
+  % --- Document type label ---
+  \node[anchor=north west] at ([xshift=0.7in, yshift=-2.5in]TL) {%
+    {\fontsize{13}{16}\selectfont\bfseries\color{meosteel}%
+     \addfontfeatures{LetterSpace=3}%
+     \MakeUppercase{Technical Brief}}%
+  };
+
+  % --- Title ---
+  \node[anchor=north west, text width=7in] at ([xshift=0.7in, yshift=-3.0in]TL) {%
+    {\fontsize{44}{50}\bfseries\color{meonearblack}%
+     \addfontfeatures{LetterSpace=-3}%
+     AI News Audit\par}%
+  };
+  \node[anchor=north west, text width=7in] at ([xshift=0.7in, yshift=-3.8in]TL) {%
+    {\fontsize{15}{20}\selectfont\color{captiontext}%
+     How AI Models Use and Distribute Canadian Journalism}%
+  };
+
+  % --- Colour bar (MEO blue) ---
+  {\color{meosteel}\fill ([xshift=0.7in, yshift=-4.35in]TL) rectangle ([yshift=-4.55in]TR);}
+
+  % --- Authors ---
+  \node[anchor=north west, text width=6in] at ([xshift=0.7in, yshift=-5.0in]TL) {%
+    {\fontsize{12}{16}\selectfont\bfseries\color{meonearblack}%
+     Aengus Bridgman \& Taylor Owen\par}%
+    \vspace{8pt}%
+    {\fontsize{8.5}{11.5}\selectfont\color{captiontext}%
+     \textbf{Aengus Bridgman} is Associate Director, Research, and Director of the Media Ecosystem Observatory at the Centre for Media, Technology and Democracy, McGill University.\par}%
+    \vspace{4pt}%
+    {\fontsize{8.5}{11.5}\selectfont\color{captiontext}%
+     \textbf{Taylor Owen} is the Beaverbrook Chair in Media, Ethics and Communication and Founding Director of the Centre for Media, Technology and Democracy, McGill University.\par}%
+    \vspace{10pt}%
+    {\fontsize{9}{12}\selectfont\color{captiontext}%
+     \MakeUppercase{$date$}\par}%
+  };
+
+\end{tikzpicture}
+\newpage
+
+% ═══════════════════════════════════════════════
+% BODY
+% ═══════════════════════════════════════════════
+\pagestyle{fancy}
+
+% First bilingual div (exec summary) no longer needs \clearpage —
+% the \newpage above already ended the cover page.
+$body$
+
+% ═══════════════════════════════════════════════
+% HERITAGE CANADA FUNDING FOOTER
+% ═══════════════════════════════════════════════
+\vfill
+\noindent\textcolor{rulecolor}{\rule{\textwidth}{0.5pt}}
+\vspace{6pt}
+
+\noindent
+\begin{minipage}[c]{0.65\textwidth}
+\fontsize{8}{10}\selectfont\color{captiontext}%
+The work of the Media Ecosystem Observatory and the Canadian Digital Media Research
+Network is funded in part by Heritage Canada's Digital Citizen Initiative.
+\end{minipage}%
+\hfill
+\begin{minipage}[c]{0.25\textwidth}
+\raggedleft
+\IfFileExists{images/wordmark_C.png}{%
+  \includegraphics[height=0.25in]{images/wordmark_C.png}%
+}{}
+\end{minipage}
+
+\vspace{12pt}
+
+\end{document}

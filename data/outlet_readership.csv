@@ -1,0 +1,37 @@
+outlet,domain,monthly_visits,category,source,source_date,retrieved
+CBC News,cbc.ca,64310000,Canadian news (free),SimilarWeb,2026-01,2026-03-03
+CP24,cp24.com,13970000,Canadian news (free),SimilarWeb,2026-01,2026-03-03
+CTV News,ctvnews.ca,32740000,Canadian news (free),SimilarWeb,2026-01,2026-03-03
+City News,citynews.ca,12720000,Canadian news (free),SimilarWeb,2026-01,2026-03-03
+Global News,globalnews.ca,22110000,Canadian news (free),SimilarWeb,2026-01,2026-03-03
+La Presse,lapresse.ca,28490000,Canadian news (free),SimilarWeb,2026-01,2026-03-03
+Radio-Canada,ici.radio-canada.ca,26530000,Canadian news (free),SimilarWeb,2026-01,2026-03-03
+Sportsnet,sportsnet.ca,21730000,Canadian news (free),SimilarWeb,2026-01,2026-03-03
+TSN,tsn.ca,18110000,Canadian news (free),SimilarWeb,2026-01,2026-03-03
+The Canadian Press,thecanadianpress.com,43404,Canadian news (free),SimilarWeb,2026-01,2026-03-03
+BNN Bloomberg,bnnbloomberg.ca,3197000,Canadian news (paywalled),SimilarWeb,2026-01,2026-03-03
+Calgary Herald,calgaryherald.com,3177000,Canadian news (paywalled),SimilarWeb,2026-01,2026-03-03
+Edmonton Journal,edmontonjournal.com,3431000,Canadian news (paywalled),SimilarWeb,2026-01,2026-03-03
+Financial Post,financialpost.com,1973000,Canadian news (paywalled),SimilarWeb,2026-01,2026-03-03
+Halifax Examiner,halifaxexaminer.ca,136932,Canadian news (paywalled),SimilarWeb,2026-01,2026-03-03
+Montreal Gazette,montrealgazette.com,2477000,Canadian news (paywalled),SimilarWeb,2026-01,2026-03-03
+National Post,nationalpost.com,8376000,Canadian news (paywalled),SimilarWeb,2026-01,2026-03-03
+Ottawa Citizen,ottawacitizen.com,1799000,Canadian news (paywalled),SimilarWeb,2026-01,2026-03-03
+Rebel News,rebelnews.com,531770,Canadian news (paywalled),SimilarWeb,2026-01,2026-03-03
+The Globe and Mail,theglobeandmail.com,18980000,Canadian news (paywalled),SimilarWeb,2026-01,2026-03-03
+Toronto Star,thestar.com,12980000,Canadian news (paywalled),SimilarWeb,2026-01,2026-03-03
+Vancouver Sun,vancouversun.com,3099000,Canadian news (paywalled),SimilarWeb,2026-01,2026-03-03
+ABC News,abcnews.go.com,62900000,International news,SimilarWeb,2026-01,2026-03-03
+Al Jazeera,aljazeera.com,58760000,International news,SimilarWeb,2026-01,2026-03-03
+BBC,bbc.com,547100000,International news,SimilarWeb,2026-01,2026-03-03
+Bloomberg,bloomberg.com,45530000,International news,SimilarWeb,2026-01,2026-03-03
+CNN,cnn.com,443800000,International news,SimilarWeb,2026-01,2026-03-03
+ESPN,espn.com,557100000,International news,SimilarWeb,2026-01,2026-03-03
+Fox News,foxnews.com,244700000,International news,SimilarWeb,2026-01,2026-03-03
+NHL.com,nhl.com,53330000,International news,SimilarWeb,2026-01,2026-03-03
+NPR,npr.org,71200000,International news,SimilarWeb,2026-01,2026-03-03
+Reuters,reuters.com,96470000,International news,SimilarWeb,2026-01,2026-03-03
+The Atlantic,theatlantic.com,34510000,International news,SimilarWeb,2026-01,2026-03-03
+The Guardian,theguardian.com,338000000,International news,SimilarWeb,2026-01,2026-03-03
+The New York Times,nytimes.com,695000000,International news,SimilarWeb,2026-01,2026-03-03
+The Washington Post,washingtonpost.com,84110000,International news,SimilarWeb,2026-01,2026-03-03
